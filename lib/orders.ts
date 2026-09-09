@@ -1,18 +1,24 @@
 export type AIPlan = {
+  visualSummary?: string;
+  bestMoments?: Array<{ clip: string; timestampSeconds: number; reason: string }>;
   targetDurationSeconds: number;
-  aspectRatio: "9:16" | string;
+  aspectRatio?: "9:16" | string;
   hook: string;
-  clipSequence: Array<{ clip: string; startSeconds: number; endSeconds: number; reason: string }>;
-  captions: Array<{ text: string; placement: string; style: string }>;
-  transitions: Array<{ afterClip: string; type: string }>;
+  clipSequence: Array<{ clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; reason: string }>;
+  captions?: Array<{ text: string; placement: string; style: string }>;
+  captionIdeas?: string[];
+  transitions?: Array<{ afterClip: string; type: string }>;
+  transitionDirection?: string;
   audioDirection: string;
   colorDirection: string;
   ending: string;
 };
 
+export type EditMode = "ai" | "human" | "both";
+
 export type EditOrder = {
   id: string;
-  mode: "ai" | "human" | "both";
+  mode: EditMode;
   modeLabel: string;
   format: string;
   vibe: string;
@@ -22,8 +28,9 @@ export type EditOrder = {
   clipUrls?: string[];
   clipCount: number;
   status: "submitted" | "processing" | "in_review" | "completed";
-  aiStatus?: "not_started" | "queued" | "ready" | "failed";
+  aiStatus?: "not_started" | "queued" | "analyzing" | "ready" | "failed";
   aiPlan?: AIPlan;
+  aiError?: string;
   createdAt: string;
 };
 
