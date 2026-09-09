@@ -38,6 +38,8 @@ export type EditOrder = {
   revisionNote?: string;
   revisionCount?: number;
   renderStatus?: "not_started" | "rendering" | "ready" | "failed";
+  finalRenderStatus?: "not_started" | "rendering" | "ready" | "failed";
+  finalError?: string;
   createdAt: string;
 };
 
