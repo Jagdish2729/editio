@@ -31,6 +31,8 @@ export type EditOrder = {
   aiStatus?: "not_started" | "queued" | "analyzing" | "ready" | "failed";
   aiPlan?: AIPlan;
   aiError?: string;
+  draftUrl?: string;
+  renderStatus?: "not_started" | "rendering" | "ready" | "failed";
   createdAt: string;
 };
 
