@@ -27,7 +27,7 @@ export async function POST(request: Request) {
       uploaded.push({
         originalName: file.name,
         path: `data/uploads/${storedName}`,
-        url: `/api/uploads/${storedName}`,
+        url: `/api/uploads/file?name=${encodeURIComponent(storedName)}`,
         size: file.size,
         type: file.type,
       });
