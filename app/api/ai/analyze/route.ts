@@ -4,34 +4,66 @@ import type { VideoFrame } from "../../../../lib/video-analysis";
 export const runtime = "nodejs";
 
 type AnalyzeRequest = {
-  orderId: string; editType: string; format: string; vibe: string; brief: string; reference?: string;
-  includeHook?: boolean; includeCaptions?: boolean; frames: VideoFrame[];
+  orderId: string;
+  editType: string;
+  format: string;
+  vibe: string;
+  brief: string;
+  reference?: string;
+  includeHook?: boolean;
+  includeCaptions?: boolean;
+  frames: VideoFrame[];
 };
 
-function parseJson(text: string) {
+type RawPlan = {
+  visualSummary?: string;
+  bestMoments?: Array<{ clip?: string; timestampSeconds?: number; reason?: string }>;
+  targetDurationSeconds?: number;
+  aspectRatio?: string;
+  hook?: string;
+  clipSequence?: Array<{ clip?: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; reason?: string }>;
+  captions?: Array<{ text?: string; placement?: string; style?: string; startSeconds?: number; endSeconds?: number }>;
+  captionIdeas?: string[];
+  transitions?: Array<{ afterClip?: string; type?: string }>;
+  transitionDirection?: string;
+  audioDirection?: string;
+  colorDirection?: string;
+  ending?: string;
+};
+
+function parseJson(text: string): RawPlan {
   const cleaned = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-  return JSON.parse(cleaned);
+  return JSON.parse(cleaned) as RawPlan;
 }
 
 function localDraftPlan(body: AnalyzeRequest) {
   const grouped = new Map<string, VideoFrame[]>();
   for (const frame of body.frames) grouped.set(frame.clipName, [...(grouped.get(frame.clipName) || []), frame]);
-  const clipSequence = Array.from(grouped.entries()).flatMap(([clip, frames]) => {
-    const chosen = frames[Math.floor(frames.length / 2)] || frames[0];
-    return chosen ? [{ clip, timestampSeconds: chosen.timestampSeconds, reason: "Development fallback selected a representative point from this uploaded clip." }] : [];
+  const candidates = Array.from(grouped.entries()).flatMap(([clip, frames]) => {
+    const picks = frames.length > 2 ? [frames[1], frames[Math.floor(frames.length / 2)], frames[frames.length - 2]] : frames;
+    return picks.filter(Boolean).map((frame, index) => ({
+      clip,
+      timestampSeconds: frame.timestampSeconds,
+      startSeconds: Math.max(0, frame.timestampSeconds - (index === 0 ? 1.2 : 1.5)),
+      endSeconds: Math.min(frame.durationSeconds, frame.timestampSeconds + (index === 2 ? 1.8 : 2.2)),
+      reason: "Development fallback selected a representative moment from the uploaded footage."
+    }));
   });
+  const clipSequence = candidates.slice(0, 8);
   return {
-    visualSummary: "Development draft plan generated locally. A real AI provider can replace this with visual moment selection.",
-    bestMoments: clipSequence.map(item => ({ ...item })),
-    targetDurationSeconds: Math.min(20, Math.max(6, clipSequence.length * 6)),
+    visualSummary: "Development fallback montage. Connect a real vision-capable model for content-aware selection.",
+    bestMoments: clipSequence.map(item => ({ clip: item.clip, timestampSeconds: item.timestampSeconds, reason: item.reason })),
+    targetDurationSeconds: Math.max(6, Math.min(24, clipSequence.reduce((sum, item) => sum + (item.endSeconds - item.startSeconds), 0))),
     aspectRatio: "9:16",
-    hook: body.includeHook ? (body.brief ? body.brief.slice(0, 70) : `${body.vibe} — watch this`) : "",
+    hook: body.includeHook ? (body.brief ? body.brief.slice(0, 60) : "Wait for this") : "",
     clipSequence,
-    captions: body.includeCaptions ? [{ text: body.brief ? body.brief.slice(0, 55) : "Wait for it…", placement: "bottom", style: "bold", startSeconds: 0, endSeconds: 4 }] : [],
-    captionIdeas: body.includeCaptions ? [body.brief ? body.brief.slice(0, 55) : "Wait for it…"] : [],
-    transitions: [], transitionDirection: "Clean cuts",
-    audioDirection: "Keep source audio. No music added by EDITIO.",
-    colorDirection: "Natural source look.", ending: "End on the strongest available moment."
+    captions: body.includeCaptions ? [{ text: body.brief ? body.brief.slice(0, 55) : "Watch this", placement: "bottom", style: "bold", startSeconds: 0, endSeconds: 3 }] : [],
+    captionIdeas: body.includeCaptions ? [body.brief ? body.brief.slice(0, 55) : "Watch this"] : [],
+    transitions: [],
+    transitionDirection: "Hard cuts with momentum",
+    audioDirection: "Keep source audio only. No music added by EDITIO.",
+    colorDirection: "Natural source look with a clean, consistent grade.",
+    ending: "Finish on the strongest available moment and avoid dead air."
   };
 }
 
@@ -41,10 +73,64 @@ function isPlaceholderKey(key: string | undefined) {
   return normalized === "your_api_key_here" || normalized.includes("your_api_key") || normalized.includes("replace_with");
 }
 
+function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
+  const clipDurations = new Map<string, number>();
+  for (const frame of body.frames) clipDurations.set(frame.clipName, Math.max(0, frame.durationSeconds));
+  const knownClips = new Set(clipDurations.keys());
+
+  const sequence = (raw.clipSequence || []).filter(item => item.clip && knownClips.has(item.clip)).slice(0, 8).map(item => {
+    const duration = clipDurations.get(item.clip!) || 0;
+    const anchor = Number(item.timestampSeconds);
+    let start = Number(item.startSeconds);
+    let end = Number(item.endSeconds);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      const safeAnchor = Number.isFinite(anchor) ? anchor : duration * 0.5;
+      start = Math.max(0, safeAnchor - 1.5);
+      end = Math.min(duration || safeAnchor + 2.5, safeAnchor + 2.5);
+    }
+    start = Math.max(0, Math.min(start, Math.max(0, duration - 0.25)));
+    end = Math.max(start + 0.75, Math.min(end, duration || end));
+    return {
+      ...item,
+      startSeconds: Number(start.toFixed(2)),
+      endSeconds: Number(end.toFixed(2)),
+      timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
+      reason: item.reason || "Selected as a strong visual moment."
+    };
+  }).filter(item => Number(item.endSeconds) > Number(item.startSeconds));
+
+  const target = sequence.reduce((sum, item) => sum + Number(item.endSeconds) - Number(item.startSeconds), 0);
+  const captions = body.includeCaptions ? (raw.captions || []).filter(item => item.text).slice(0, 5).map(item => ({
+    text: String(item.text).trim().slice(0, 90),
+    placement: ["top", "center", "bottom"].includes(String(item.placement)) ? String(item.placement) : "bottom",
+    style: item.style === "clean" ? "clean" : "bold",
+    startSeconds: Math.max(0, Number(item.startSeconds) || 0),
+    endSeconds: Math.max(0.5, Number(item.endSeconds) || 3)
+  })) : [];
+
+  return {
+    ...raw,
+    visualSummary: raw.visualSummary || "AI-selected short-form edit from the supplied footage.",
+    targetDurationSeconds: Math.max(6, Math.min(24, Math.round(target || Number(raw.targetDurationSeconds) || 15))),
+    aspectRatio: "9:16",
+    hook: body.includeHook ? String(raw.hook || "").trim().slice(0, 70) : "",
+    clipSequence: sequence,
+    captions,
+    captionIdeas: body.includeCaptions ? (raw.captionIdeas || []).slice(0, 6) : [],
+    transitions: raw.transitions || [],
+    transitionDirection: raw.transitionDirection || "Hard cuts with momentum",
+    audioDirection: "Keep source audio only. No music added by EDITIO.",
+    colorDirection: raw.colorDirection || "Clean, consistent source grade.",
+    ending: raw.ending || "End on the strongest moment without dead air."
+  };
+}
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as AnalyzeRequest;
-    if (!body.orderId || !body.format || !body.vibe || !body.frames?.length) return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
+    if (!body.orderId || !body.format || !body.vibe || !body.frames?.length) {
+      return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
+    }
 
     const apiKey = process.env.OPENAI_API_KEY;
     const useLocalFallback = process.env.EDITIO_AI_FALLBACK !== "false";
@@ -54,27 +140,91 @@ export async function POST(request: Request) {
     }
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    const frameText = body.frames.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, timestamp=${frame.timestampSeconds}s`).join("\n");
-    const hookInstruction = body.includeHook ? "Generate one short, punchy opening hook to display in the first 2–3 seconds." : "Do not add an opening hook.";
-    const captionInstruction = body.includeCaptions ? "Generate 1–4 concise on-screen caption lines with approximate startSeconds/endSeconds, matched to the footage and brief." : "Do not add on-screen captions.";
-    const content: Array<Record<string, unknown>> = [{ type: "text", text: `You are EDITIO's visual AI video editor. Analyze the supplied frames from the creator's actual footage and create a practical first-cut plan.\n\nORDER: ${body.orderId}\nEDIT TYPE: ${body.editType}\nFORMAT: ${body.format}\nVIBE: ${body.vibe}\nCREATOR BRIEF: ${body.brief || "Use the selected vibe as the creative direction."}\nREFERENCE: ${body.reference || "None"}\nHOOK: ${body.includeHook ? "YES" : "NO"}\nCAPTIONS: ${body.includeCaptions ? "YES" : "NO"}\n\n${hookInstruction}\n${captionInstruction}\nNo music should be added; keep source audio.\n\n${frameText}\n\nOnly recommend moments visually supported by the supplied frames. Treat timestamps as approximate anchors. Build a useful short-form sequence, not a single arbitrary moment. Prefer a strong opening and remove dead space. Return JSON only with: {\"visualSummary\":\"string\",\"bestMoments\":[{\"clip\":\"filename\",\"timestampSeconds\":number,\"reason\":\"string\"}],\"targetDurationSeconds\":number,\"aspectRatio\":\"9:16\",\"hook\":\"string or empty\",\"clipSequence\":[{\"clip\":\"filename\",\"timestampSeconds\":number,\"reason\":\"string\"}],\"captions\":[{\"text\":\"string\",\"placement\":\"bottom|center|top\",\"style\":\"bold|clean\",\"startSeconds\":number,\"endSeconds\":number}],\"captionIdeas\":[\"string\"],\"transitionDirection\":\"string\",\"audioDirection\":\"Keep source audio only\",\"colorDirection\":\"string\",\"ending\":\"string\"}` }];
-    for (const frame of body.frames.slice(0, 12)) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl } });
+    const frameList = body.frames.slice(0, 18);
+    const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
+    const hookInstruction = body.includeHook
+      ? "Create one short hook (maximum 7 words) for the first 2–3 seconds. It must match the actual footage/brief; do not invent a claim."
+      : "Do not add an opening hook.";
+    const captionInstruction = body.includeCaptions
+      ? "Create 1–5 short caption lines. Their startSeconds/endSeconds are TIMELINE positions in the final reel, not source-video positions. Keep each line punchy and readable."
+      : "Do not add on-screen captions.";
+
+    const prompt = `You are EDITIO's senior short-form video editor. You are given sampled frames from the creator's actual uploaded clips. Your job is to design a genuinely useful first-cut Reel, not a generic montage.
+
+CREATOR REQUEST
+- Edit type: ${body.editType}
+- Format: ${body.format}
+- Vibe: ${body.vibe}
+- Brief: ${body.brief || "No extra brief. Use the selected vibe."}
+- Reference: ${body.reference || "None"}
+- Hook requested: ${body.includeHook ? "YES" : "NO"}
+- Captions requested: ${body.includeCaptions ? "YES" : "NO"}
+
+FOOTAGE MAP
+${frameText}
+
+EDITING RULES
+1. Visually inspect every supplied frame. Choose moments that are actually supported by the images.
+2. Build a 12–24 second short-form sequence when the footage allows it. Prefer 4–8 purposeful segments, usually 1.5–4 seconds each.
+3. Start with the strongest attention-grabbing visual, not automatically the first source clip.
+4. Remove obvious dead space. Vary shot selection and avoid repeating the same moment unless it serves the story.
+5. Use the creator's brief and vibe as the primary creative direction; do not blindly apply generic trends.
+6. Every clipSequence item MUST include startSeconds and endSeconds using the SOURCE clip's timeline. They should surround the chosen visual moment and stay inside that clip's duration.
+7. timestampSeconds is the visual anchor for the selected moment.
+8. The sequence should have a clear opening, build/middle and satisfying ending. Explain why each chosen moment is there.
+9. Do not invent dialogue, actions, people, scores, locations or objects that are not visible in the supplied frames.
+10. No music. Preserve the creator's original audio.
+11. ${hookInstruction}
+12. ${captionInstruction}
+13. Keep captions away from the extreme bottom UI area. Prefer bottom/center with concise text.
+14. If the footage is weak, still make the best honest edit possible rather than fabricating a stronger moment.
+
+RETURN JSON ONLY:
+{
+  "visualSummary":"brief description of what the footage supports",
+  "bestMoments":[{"clip":"filename","timestampSeconds":number,"reason":"why this moment is strong"}],
+  "targetDurationSeconds":number,
+  "aspectRatio":"9:16",
+  "hook":"short string or empty",
+  "clipSequence":[{"clip":"filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"editing reason"}],
+  "captions":[{"text":"string","placement":"top|center|bottom","style":"bold|clean","startSeconds":number,"endSeconds":number}],
+  "captionIdeas":["string"],
+  "transitions":[{"afterClip":"filename","type":"hard cut|match cut|quick cut"}],
+  "transitionDirection":"string",
+  "audioDirection":"Keep source audio only",
+  "colorDirection":"string",
+  "ending":"string"
+}`;
+
+    const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+    for (const frame of frameList) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
 
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, temperature: 0.2, response_format: { type: "json_object" }, messages: [
-        { role: "system", content: "You create concise, production-ready editing plans. Never invent visual details that are not supported by the frames." },
-        { role: "user", content },
-      ] }),
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        temperature: 0.15,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "You are a meticulous professional Reels editor. Make decisions from the supplied images and metadata only. Return valid JSON only." },
+          { role: "user", content }
+        ]
+      })
     });
+
     const data = await response.json();
     if (!response.ok) {
-      if (useLocalFallback && (response.status === 401 || response.status === 403)) return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", fallback: true });
+      if (useLocalFallback && (response.status === 401 || response.status === 403)) {
+        return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", fallback: true });
+      }
       return NextResponse.json({ error: data?.error?.message || "AI analysis failed." }, { status: 502 });
     }
+
     const text = data?.choices?.[0]?.message?.content;
     if (!text) return NextResponse.json({ error: "AI returned an empty analysis." }, { status: 502 });
-    return NextResponse.json({ ok: true, plan: parseJson(text), model, fallback: false });
+    const plan = normalisePlan(parseJson(text), body);
+    return NextResponse.json({ ok: true, plan, model, fallback: false });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "AI analysis failed." }, { status: 500 });
   }
