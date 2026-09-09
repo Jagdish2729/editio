@@ -9,13 +9,16 @@ export default function CreatorRegister() {
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setError("");
     if (name.trim().length < 2) return setError("Tell us your name first.");
     if (!identifier.trim()) return setError("Add your email or mobile number.");
     if (password.length < 8) return setError("Password needs at least 8 characters.");
-    saveCreatorUser({ name: name.trim(), identifier: identifier.trim() });
+    setLoading(true);
+    await saveCreatorUser({ name: name.trim(), identifier: identifier.trim() }, password);
     startSession();
     window.location.href = "/creator/dashboard";
   }
@@ -33,7 +36,7 @@ export default function CreatorRegister() {
             <label>Email or mobile<input value={identifier} onChange={e => setIdentifier(e.target.value)} type="text" placeholder="you@example.com" autoComplete="username" /></label>
             <label>Create password<input value={password} onChange={e => setPassword(e.target.value)} type="password" placeholder="At least 8 characters" autoComplete="new-password" /></label>
             {error && <div className="authError">{error}</div>}
-            <button className="authSubmit" type="submit">Create my account <span>↗</span></button>
+            <button className="authSubmit" type="submit" disabled={loading}>{loading ? "Creating…" : "Create my account"} <span>↗</span></button>
           </form>
           <p className="authFoot">Already have an account? <Link href="/creator/login">Sign in ↗</Link></p>
         </div>
