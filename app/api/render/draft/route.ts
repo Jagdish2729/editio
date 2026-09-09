@@ -3,7 +3,6 @@ import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import path from "path";
 import crypto from "crypto";
 import { spawn } from "child_process";
-import ffmpegPath from "ffmpeg-static";
 
 export const runtime = "nodejs";
 
@@ -11,14 +10,36 @@ type RenderClip = { originalName: string; url: string };
 type SequenceItem = { clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number };
 type RenderPlan = { aspectRatio?: string; clipSequence?: SequenceItem[] };
 
+async function resolveFfmpeg() {
+  // Do not rely on ffmpeg-static's __dirname after Next.js bundles the route.
+  // On Windows that can turn into a virtual \ROOT path and spawn() then throws ENOENT.
+  const candidates = [
+    path.join(process.cwd(), "node_modules", "ffmpeg-static", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"),
+    path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg.exe"),
+    path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg"),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      await stat(candidate);
+      return candidate;
+    } catch {
+      // Try the next known location.
+    }
+  }
+
+  // Last resort: use an ffmpeg executable already available on PATH.
+  return process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+}
+
 function runFfmpeg(args: string[]) {
-  return new Promise<void>((resolve, reject) => {
-    if (!ffmpegPath) return reject(new Error("FFmpeg binary is unavailable. Run npm install and restart the dev server."));
-    const child = spawn(ffmpegPath, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  return new Promise<void>(async (resolve, reject) => {
+    const executable = await resolveFfmpeg();
+    const child = spawn(executable, args, { cwd: process.cwd(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("error", reject);
-    child.on("close", code => code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code}): ${stderr.slice(-1800)}`)));
+    child.on("error", error => reject(new Error(`${error.message} | FFmpeg executable: ${executable}`)));
+    child.on("close", code => code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code}) using ${executable}: ${stderr.slice(-1800)}`)));
   });
 }
 
@@ -108,8 +129,6 @@ export async function POST(request: Request) {
     const tempFiles: string[] = [];
     let lastError = "";
 
-    // First try the AI-selected cuts, one segment at a time. This is deliberately
-    // simpler than one giant filter graph so a single bad timestamp cannot kill the job.
     if (planParts.length) {
       try {
         for (let i = 0; i < planParts.length; i++) {
@@ -134,9 +153,6 @@ export async function POST(request: Request) {
       }
     }
 
-    // Hard fallback: if the AI-selected cuts fail for any reason, render the first
-    // uploaded video as a clean 9:16 draft. The creator should never be left with a
-    // permanently stuck order just because an AI timestamp or codec was imperfect.
     try {
       await stat(outputPath);
     } catch {
