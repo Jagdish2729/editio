@@ -125,31 +125,15 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
   };
 }
 
-export async function POST(request: Request) {
-  try {
-    const body = (await request.json()) as AnalyzeRequest;
-    if (!body.orderId || !body.format || !body.vibe || !body.frames?.length) {
-      return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
-    }
+const EDITOR_PROMPT = (body: AnalyzeRequest, frameText: string) => {
+  const hookInstruction = body.includeHook
+    ? "Create one short hook (maximum 7 words) for the first 2–3 seconds. It must match the actual footage/brief; do not invent a claim."
+    : "Do not add an opening hook.";
+  const captionInstruction = body.includeCaptions
+    ? "Create 1–5 short caption lines. Their startSeconds/endSeconds are TIMELINE positions in the final reel, not source-video positions. Keep each line punchy and readable."
+    : "Do not add on-screen captions.";
 
-    const apiKey = process.env.OPENAI_API_KEY;
-    const useLocalFallback = process.env.EDITIO_AI_FALLBACK !== "false";
-    if (isPlaceholderKey(apiKey)) {
-      if (!useLocalFallback) return NextResponse.json({ error: "OPENAI_API_KEY is not configured. Add a real API key to .env.local." }, { status: 503 });
-      return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", fallback: true });
-    }
-
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    const frameList = body.frames.slice(0, 18);
-    const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
-    const hookInstruction = body.includeHook
-      ? "Create one short hook (maximum 7 words) for the first 2–3 seconds. It must match the actual footage/brief; do not invent a claim."
-      : "Do not add an opening hook.";
-    const captionInstruction = body.includeCaptions
-      ? "Create 1–5 short caption lines. Their startSeconds/endSeconds are TIMELINE positions in the final reel, not source-video positions. Keep each line punchy and readable."
-      : "Do not add on-screen captions.";
-
-    const prompt = `You are EDITIO's senior short-form video editor. You are given sampled frames from the creator's actual uploaded clips. Your job is to design a genuinely useful first-cut Reel, not a generic montage.
+  return `You are EDITIO's senior short-form video editor. You are given sampled frames from the creator's actual uploaded clips. Your job is to design a genuinely useful first-cut Reel, not a generic montage.
 
 CREATOR REQUEST
 - Edit type: ${body.editType}
@@ -195,36 +179,116 @@ RETURN JSON ONLY:
   "colorDirection":"string",
   "ending":"string"
 }`;
+};
 
-    const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
-    for (const frame of frameList) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
+function dataUrlToGeminiPart(dataUrl: string) {
+  const match = dataUrl.match(/^data:([^;,]+)(?:;[^,]*)?,(.*)$/s);
+  if (!match) return null;
+  return {
+    inline_data: {
+      mime_type: match[1],
+      data: match[2]
+    }
+  };
+}
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
+async function analyzeWithGemini(body: AnalyzeRequest, apiKey: string, model: string) {
+  const frameList = body.frames.slice(0, 18);
+  const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
+  const parts: Array<Record<string, unknown>> = [{ text: EDITOR_PROMPT(body, frameText) }];
+
+  for (const frame of frameList) {
+    const imagePart = dataUrlToGeminiPart(frame.imageDataUrl);
+    if (imagePart) parts.push(imagePart);
+  }
+
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts }],
+      generationConfig: {
         temperature: 0.15,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: "You are a meticulous professional Reels editor. Make decisions from the supplied images and metadata only. Return valid JSON only." },
-          { role: "user", content }
-        ]
-      })
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-      if (useLocalFallback && (response.status === 401 || response.status === 403)) {
-        return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", fallback: true });
+        responseMimeType: "application/json"
       }
-      return NextResponse.json({ error: data?.error?.message || "AI analysis failed." }, { status: 502 });
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || "Gemini analysis failed.");
+
+  const text = data?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("").trim();
+  if (!text) throw new Error("Gemini returned an empty analysis.");
+  return parseJson(text);
+}
+
+async function analyzeWithOpenAI(body: AnalyzeRequest, apiKey: string, model: string) {
+  const frameList = body.frames.slice(0, 18);
+  const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
+  const content: Array<Record<string, unknown>> = [{ type: "text", text: EDITOR_PROMPT(body, frameText) }];
+  for (const frame of frameList) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      temperature: 0.15,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "You are a meticulous professional Reels editor. Make decisions from the supplied images and metadata only. Return valid JSON only." },
+        { role: "user", content }
+      ]
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || "OpenAI analysis failed.");
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error("OpenAI returned an empty analysis.");
+  return parseJson(text);
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = (await request.json()) as AnalyzeRequest;
+    if (!body.orderId || !body.format || !body.vibe || !body.frames?.length) {
+      return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
     }
 
-    const text = data?.choices?.[0]?.message?.content;
-    if (!text) return NextResponse.json({ error: "AI returned an empty analysis." }, { status: 502 });
-    const plan = normalisePlan(parseJson(text), body);
-    return NextResponse.json({ ok: true, plan, model, fallback: false });
+    // Gemini is the default provider for EDITIO's visual planning. OpenAI remains
+    // available as a provider option so we can compare quality without rewriting the pipeline.
+    const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").trim().toLowerCase();
+    const useLocalFallback = process.env.EDITIO_AI_FALLBACK !== "false";
+    const apiKey = provider === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
+
+    if (isPlaceholderKey(apiKey)) {
+      if (!useLocalFallback) {
+        return NextResponse.json({
+          error: provider === "openai"
+            ? "OPENAI_API_KEY is not configured. Add a real API key to .env.local."
+            : "GEMINI_API_KEY is not configured. Add a real Gemini API key to .env.local."
+        }, { status: 503 });
+      }
+      return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", provider, fallback: true });
+    }
+
+    const model = provider === "openai"
+      ? (process.env.OPENAI_MODEL || "gpt-4o-mini")
+      : (process.env.GEMINI_MODEL || "gemini-2.5-flash");
+
+    try {
+      const rawPlan = provider === "openai"
+        ? await analyzeWithOpenAI(body, apiKey!, model)
+        : await analyzeWithGemini(body, apiKey!, model);
+      const plan = normalisePlan(rawPlan, body);
+      return NextResponse.json({ ok: true, plan, model, provider, fallback: false });
+    } catch (error) {
+      if (useLocalFallback) {
+        return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", provider, fallback: true, aiError: error instanceof Error ? error.message : "AI analysis failed." });
+      }
+      return NextResponse.json({ error: error instanceof Error ? error.message : "AI analysis failed." }, { status: 502 });
+    }
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "AI analysis failed." }, { status: 500 });
   }
