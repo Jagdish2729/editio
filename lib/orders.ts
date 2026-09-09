@@ -5,7 +5,7 @@ export type AIPlan = {
   aspectRatio?: "9:16" | string;
   hook: string;
   clipSequence: Array<{ clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; reason: string }>;
-  captions?: Array<{ text: string; placement: string; style: string }>;
+  captions?: Array<{ text: string; placement: string; style: string; startSeconds?: number; endSeconds?: number }>;
   captionIdeas?: string[];
   transitions?: Array<{ afterClip: string; type: string }>;
   transitionDirection?: string;
@@ -24,6 +24,8 @@ export type EditOrder = {
   vibe: string;
   brief: string;
   reference: string;
+  includeHook?: boolean;
+  includeCaptions?: boolean;
   clipNames: string[];
   clipUrls?: string[];
   clipCount: number;
