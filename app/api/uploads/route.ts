@@ -20,11 +20,17 @@ export async function POST(request: Request) {
     const uploaded = [];
     for (const file of files) {
       if (!file.type.startsWith("video/")) continue;
-      const extension = path.extname(file.name) || ".mp4";
+      const extension = path.extname(file.name).toLowerCase() || ".mp4";
       const storedName = `${crypto.randomUUID()}${extension}`;
       const buffer = Buffer.from(await file.arrayBuffer());
       await writeFile(path.join(uploadDir, storedName), buffer);
-      uploaded.push({ originalName: file.name, path: `data/uploads/${storedName}`, size: file.size, type: file.type });
+      uploaded.push({
+        originalName: file.name,
+        path: `data/uploads/${storedName}`,
+        url: `/api/uploads/${storedName}`,
+        size: file.size,
+        type: file.type,
+      });
     }
 
     if (!uploaded.length) {
