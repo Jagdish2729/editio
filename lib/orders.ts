@@ -7,6 +7,7 @@ export type EditOrder = {
   brief: string;
   reference: string;
   clipNames: string[];
+  clipUrls?: string[];
   clipCount: number;
   status: "submitted" | "processing" | "in_review" | "completed";
   createdAt: string;
