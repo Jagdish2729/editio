@@ -1,3 +1,5 @@
+import type { AIPlan } from "./orders";
+
 export type EditMode = "ai" | "human" | "both";
 
 export type AIEditBrief = {
@@ -28,10 +30,13 @@ ${input.brief || "No extra instructions were provided. Use the selected vibe as 
 REFERENCE
 ${input.reference || "No reference reel provided."}
 
-YOUR JOB
-Analyze the available footage and produce an editing plan that a video rendering engine can execute. Decide the strongest hook, clip order, trims, pacing, transitions, captions, music/SFX direction, framing/cropping and ending. Prioritize the creator's brief over generic trends.
+IMPORTANT
+The footage is uploaded separately. For this planning pass, use the supplied clip names and creator brief. Do not invent exact visual events that cannot be verified. Keep cuts conservative when timing is unknown.
 
-RETURN JSON ONLY with this shape:
+YOUR JOB
+Create a practical first-cut plan that a rendering engine can execute. Decide the strongest opening direction, clip order, approximate trims, pacing, captions, transitions, audio direction, framing/cropping and ending. Prioritize the creator's brief over generic trends.
+
+RETURN JSON ONLY with this exact shape:
 {
   "targetDurationSeconds": number,
   "aspectRatio": "9:16",
@@ -52,4 +57,43 @@ export function buildAIJob(input: AIEditBrief) {
     prompt: buildAIEditPrompt(input),
     createdAt: new Date().toISOString(),
   };
+}
+
+function cleanJson(text: string) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  return (fenced?.[1] || text).trim();
+}
+
+export async function generateAIPlan(input: AIEditBrief): Promise<AIPlan> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured.");
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.7,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "You are EDITIO's structured AI video editing planner. Return valid JSON only." },
+        { role: "user", content: buildAIEditPrompt(input) },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`AI provider error (${response.status}): ${detail.slice(0, 300)}`);
+  }
+
+  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error("AI provider returned an empty plan.");
+
+  return JSON.parse(cleanJson(content)) as AIPlan;
 }
