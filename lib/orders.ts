@@ -1,3 +1,15 @@
+export type AIPlan = {
+  targetDurationSeconds: number;
+  aspectRatio: "9:16" | string;
+  hook: string;
+  clipSequence: Array<{ clip: string; startSeconds: number; endSeconds: number; reason: string }>;
+  captions: Array<{ text: string; placement: string; style: string }>;
+  transitions: Array<{ afterClip: string; type: string }>;
+  audioDirection: string;
+  colorDirection: string;
+  ending: string;
+};
+
 export type EditOrder = {
   id: string;
   mode: "ai" | "human" | "both";
@@ -10,6 +22,8 @@ export type EditOrder = {
   clipUrls?: string[];
   clipCount: number;
   status: "submitted" | "processing" | "in_review" | "completed";
+  aiStatus?: "not_started" | "queued" | "ready" | "failed";
+  aiPlan?: AIPlan;
   createdAt: string;
 };
 
@@ -34,4 +48,11 @@ export function createOrder(order: Omit<EditOrder, "id" | "createdAt" | "status"
   };
   localStorage.setItem(ORDERS_KEY, JSON.stringify([next, ...getOrders()]));
   return next;
+}
+
+export function updateOrder(id: string, patch: Partial<EditOrder>) {
+  if (typeof window === "undefined") return null;
+  const next = getOrders().map(order => order.id === id ? { ...order, ...patch } : order);
+  localStorage.setItem(ORDERS_KEY, JSON.stringify(next));
+  return next.find(order => order.id === id) || null;
 }
