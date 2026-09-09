@@ -31,7 +31,7 @@ export default function CreatorLogin() {
           <div className="authCardTop"><div><div className="eyebrow">WELCOME BACK</div><h2>Creator login</h2></div><div className="authMark">✦</div></div>
           <form className="authForm" onSubmit={submit}>
             <label>Email or mobile<input value={identifier} onChange={e => setIdentifier(e.target.value)} type="text" placeholder="you@example.com" autoComplete="username" /></label>
-            <label>Password><div className="passwordWrap"><input value={password} onChange={e => setPassword(e.target.value)} type={showPassword ? "text" : "password"} placeholder="••••••••" autoComplete="current-password" /><span onClick={() => setShowPassword(v => !v)}>{showPassword ? "Hide" : "Show"}</span></div></label>
+            <label>Password<div className="passwordWrap"><input value={password} onChange={e => setPassword(e.target.value)} type={showPassword ? "text" : "password"} placeholder="••••••••" autoComplete="current-password" /><span onClick={() => setShowPassword(v => !v)}>{showPassword ? "Hide" : "Show"}</span></div></label>
             <div className="formMeta"><label className="check"><input type="checkbox" /> Remember me</label><a href="#">Forgot password?</a></div>
             {error && <div className="authError">{error}</div>}
             <button className="authSubmit" type="submit">Sign in <span>↗</span></button>
