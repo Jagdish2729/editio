@@ -29,11 +29,14 @@ export type EditOrder = {
   clipNames: string[];
   clipUrls?: string[];
   clipCount: number;
-  status: "submitted" | "processing" | "in_review" | "completed";
+  status: "submitted" | "processing" | "in_review" | "revision_requested" | "completed";
   aiStatus?: "not_started" | "queued" | "analyzing" | "ready" | "failed";
   aiPlan?: AIPlan;
   aiError?: string;
   draftUrl?: string;
+  finalUrl?: string;
+  revisionNote?: string;
+  revisionCount?: number;
   renderStatus?: "not_started" | "rendering" | "ready" | "failed";
   createdAt: string;
 };
