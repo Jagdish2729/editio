@@ -4,7 +4,7 @@ export default function Home() {
       <nav className="nav">
         <a className="logo" href="#">EDIT<span>IO</span></a>
         <div className="navLinks"><a href="#services">How it works</a><a href="#services">Services</a><a href="#start">For creators</a></div>
-        <button className="navCta">Get started ↗</button>
+        <a className="navCta" href="/creator/login">Get started ↗</a>
       </nav>
 
       <section className="hero">
@@ -12,7 +12,7 @@ export default function Home() {
           <div className="kicker"><span className="dot" /> MADE FOR THE SCROLL GENERATION</div>
           <h1>Turn raw clips into <span className="highlight">content.</span></h1>
           <p className="heroText">Shoot it. Upload it. We&apos;ll make it scroll-stopping. Choose AI speed, human creativity, or the best of both.</p>
-          <div className="actions"><button className="primary">Edit my Reel ↗</button><button className="secondary">See how it works ↓</button></div>
+          <div className="actions"><a className="primary" href="/creator/login">Edit my Reel ↗</a><a className="secondary" href="#services">See how it works ↓</a></div>
         </div>
         <div className="visual" aria-label="Choose your EDITIO role">
           <div className="phoneWrap">
@@ -22,10 +22,10 @@ export default function Home() {
           <div className="rolePanel">
             <div className="roleIntro"><div className="eyebrow">WELCOME TO EDITIO</div><h2 className="roleTitle">What are you here to do?</h2></div>
             <div className="roleCards">
-              <a className="roleCard" href="#creator">
+              <a className="roleCard" href="/creator/login">
                 <div className="roleIcon">✦</div><div><div className="roleName">I&apos;m a Content Creator</div><div className="roleDesc">I want my clips edited &amp; ready to post.</div></div><div className="roleArrow">↗</div>
               </a>
-              <a className="roleCard" href="#editor">
+              <a className="roleCard" href="/editor/login">
                 <div className="roleIcon">◒</div><div><div className="roleName">I&apos;m an Editor</div><div className="roleDesc">I want to edit for creators &amp; get paid.</div></div><div className="roleArrow">↗</div>
               </a>
             </div>
@@ -45,7 +45,7 @@ export default function Home() {
         </div>
       </section>
 
-      <section className="bottomCta" id="start"><div><div className="eyebrow">READY WHEN YOU ARE</div><h2>Stop spending hours editing. Start posting.</h2></div><button className="primary">Start your first edit ↗</button></section>
+      <section className="bottomCta" id="start"><div><div className="eyebrow">READY WHEN YOU ARE</div><h2>Stop spending hours editing. Start posting.</h2></div><a className="primary" href="/creator/login">Start your first edit ↗</a></section>
       <footer className="footer"><div>© 2026 EDITIO</div><div>CREATE. EDIT. POST.</div></footer>
     </main>
   );
