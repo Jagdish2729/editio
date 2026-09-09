@@ -8,15 +8,29 @@ export default function Home() {
       </nav>
 
       <section className="hero">
-        <div>
+        <div className="heroCopy">
           <div className="kicker"><span className="dot" /> MADE FOR THE SCROLL GENERATION</div>
           <h1>Turn raw clips into <span className="highlight">content.</span></h1>
           <p className="heroText">Shoot it. Upload it. We&apos;ll make it scroll-stopping. Choose AI speed, human creativity, or the best of both.</p>
           <div className="actions"><button className="primary">Edit my Reel ↗</button><button className="secondary">See how it works ↓</button></div>
         </div>
-        <div className="visual" aria-label="EDITIO reel preview">
-          <div className="sticker">YOU SHOOT.<br/>WE EDIT.</div>
-          <div className="phone"><div className="phoneTop"><div className="island" /></div><div className="video"><div className="spark">✦</div><div className="videoTag">EDITIO / 001</div><div className="videoTitle">MAKE<br/>THE<br/>SCROLL<br/>STOP.</div></div></div>
+        <div className="visual" aria-label="Choose your EDITIO role">
+          <div className="phoneWrap">
+            <div className="sticker">YOU SHOOT.<br/>WE EDIT.</div>
+            <div className="phone"><div className="phoneTop"><div className="island" /></div><div className="video"><div className="spark">✦</div><div className="videoTag">EDITIO / 001</div><div className="videoTitle">MAKE<br/>THE<br/>SCROLL<br/>STOP.</div></div></div>
+          </div>
+          <div className="rolePanel">
+            <div className="roleIntro"><div className="eyebrow">WELCOME TO EDITIO</div><h2 className="roleTitle">What are you here to do?</h2></div>
+            <div className="roleCards">
+              <a className="roleCard" href="#creator">
+                <div className="roleIcon">✦</div><div><div className="roleName">I&apos;m a Content Creator</div><div className="roleDesc">I want my clips edited &amp; ready to post.</div></div><div className="roleArrow">↗</div>
+              </a>
+              <a className="roleCard" href="#editor">
+                <div className="roleIcon">◒</div><div><div className="roleName">I&apos;m an Editor</div><div className="roleDesc">I want to edit for creators &amp; get paid.</div></div><div className="roleArrow">↗</div>
+              </a>
+            </div>
+            <div className="roleNote">No complicated creator profile. Just pick a side and get moving.</div>
+          </div>
         </div>
       </section>
 
