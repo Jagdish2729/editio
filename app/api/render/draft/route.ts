@@ -82,7 +82,6 @@ async function renderSegment(input: string, output: string, start?: number, end?
     }
   }
 }
-async function renderWhole(input: string, output: string, hook?: string, caption?: string, finalQuality = false) { await renderSegment(input, output, undefined, undefined, hook, caption, finalQuality); }
 
 export async function POST(request: Request) {
   const tempDir = path.join(process.cwd(), "data", "render-tmp");
@@ -105,36 +104,50 @@ export async function POST(request: Request) {
       return { input: found.filePath, start: Math.max(0, start), end: Math.max(start + 0.25, end) };
     }).filter(Boolean) as Array<{ input: string; start: number; end: number }>;
 
+    // Never silently render the original footage. A successful AI render must contain
+    // at least one valid segment from the AI plan.
+    if (!planParts.length) {
+      return NextResponse.json({ error: "AI did not return any valid video cuts. The original footage was not rendered as a fallback. Please retry the AI edit." }, { status: 422 });
+    }
+
     const captions = (body.plan?.captions || []).filter(c => c.text).map(c => c.text!.trim()).filter(Boolean);
     const fallbackCaption = captions.length ? captions[0] : body.plan?.captionIdeas?.[0]; const hook = body.plan?.hook?.trim();
-    const tempFiles: string[] = []; let lastError = "";
+    const tempFiles: string[] = [];
 
-    if (planParts.length) {
-      try {
-        for (let i = 0; i < planParts.length; i++) {
-          const temp = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}-${i}.mp4`);
-          await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined), finalQuality);
-          tempFiles.push(temp);
-        }
-        if (tempFiles.length === 1) await writeFile(outputPath, await readFile(tempFiles[0]));
-        else {
-          const listPath = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}.txt`);
-          await writeFile(listPath, tempFiles.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"));
-          try { await runFfmpeg(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-movflags", "+faststart", outputPath]); }
-          finally { await rm(listPath, { force: true }); }
-        }
-      } catch (error) { lastError = error instanceof Error ? error.message : "AI segment rendering failed."; await rm(outputPath, { force: true }); }
-    }
-
-    try { await stat(outputPath); }
-    catch {
-      try { await renderWhole(existing[0].filePath, outputPath, hook, fallbackCaption, finalQuality); }
-      catch (error) {
-        const fallbackError = error instanceof Error ? error.message : "Full-footage render failed.";
-        return NextResponse.json({ error: `${outputType === "final" ? "Final" : "Draft"} render failed. ${fallbackError}${lastError ? ` AI cut attempt: ${lastError}` : ""}` }, { status: 500 });
+    try {
+      for (let i = 0; i < planParts.length; i++) {
+        const temp = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}-${i}.mp4`);
+        await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined), finalQuality);
+        tempFiles.push(temp);
       }
+
+      if (tempFiles.length === 1) {
+        await writeFile(outputPath, await readFile(tempFiles[0]));
+      } else {
+        // Re-encode during concatenation so segments with different timestamps/codecs
+        // cannot fail silently and leave us tempted to fall back to the source footage.
+        const listPath = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}.txt`);
+        await writeFile(listPath, tempFiles.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"));
+        try {
+          await runFfmpeg([
+            "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+            "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast",
+            "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000",
+            "-movflags", "+faststart", outputPath,
+          ]);
+        } finally { await rm(listPath, { force: true }); }
+      }
+    } catch (error) {
+      for (const file of tempFiles) await rm(file, { force: true });
+      await rm(outputPath, { force: true });
+      const message = error instanceof Error ? error.message : "AI segment rendering failed.";
+      return NextResponse.json({ error: `AI ${outputType} render failed. ${message}` }, { status: 500 });
     }
+
     for (const file of tempFiles) await rm(file, { force: true });
-    return NextResponse.json({ ok: true, status: "ready", url: `/api/render/file?name=${encodeURIComponent(outputName)}`, outputName, outputType, usedAiCuts: planParts.length > 0 });
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Render failed." }, { status: 500 }); }
+    return NextResponse.json({ ok: true, status: "ready", url: `/api/render/file?name=${encodeURIComponent(outputName)}`, outputName, outputType, usedAiCuts: true, aiCutCount: planParts.length });
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Render failed." }, { status: 500 });
+  }
 }
