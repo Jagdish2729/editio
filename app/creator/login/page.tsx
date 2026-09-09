@@ -2,21 +2,22 @@
 
 import Link from "next/link";
 import { FormEvent, useState } from "react";
-import { getUser, startSession } from "../../../lib/session";
+import { startSession, validateCreatorLogin } from "../../../lib/session";
 
 export default function CreatorLogin() {
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const user = getUser();
+    setError("");
     if (!identifier.trim() || !password) return setError("Enter your login details to continue.");
-    if (!user || user.identifier.toLowerCase() !== identifier.trim().toLowerCase()) {
-      return setError("We couldn’t find that account. Create one first.");
-    }
+    setLoading(true);
+    const valid = await validateCreatorLogin(identifier, password);
+    if (!valid) { setLoading(false); return setError("Email/mobile or password is incorrect."); }
     startSession();
     window.location.href = "/creator/dashboard";
   }
@@ -34,7 +35,7 @@ export default function CreatorLogin() {
             <label>Password<div className="passwordWrap"><input value={password} onChange={e => setPassword(e.target.value)} type={showPassword ? "text" : "password"} placeholder="••••••••" autoComplete="current-password" /><span onClick={() => setShowPassword(v => !v)}>{showPassword ? "Hide" : "Show"}</span></div></label>
             <div className="formMeta"><label className="check"><input type="checkbox" /> Remember me</label><a href="#">Forgot password?</a></div>
             {error && <div className="authError">{error}</div>}
-            <button className="authSubmit" type="submit">Sign in <span>↗</span></button>
+            <button className="authSubmit" type="submit" disabled={loading}>{loading ? "Signing in…" : "Sign in"} <span>↗</span></button>
           </form>
           <div className="divider"><span>or</span></div><button className="socialBtn" type="button"><span className="googleG">G</span> Continue with Google</button>
           <p className="authFoot">New to EDITIO? <Link href="/creator/register">Create an account ↗</Link></p>
