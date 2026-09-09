@@ -10,6 +10,7 @@ type RenderClip = { originalName: string; url: string };
 type SequenceItem = { clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number };
 type Caption = { text?: string; placement?: string; startSeconds?: number; endSeconds?: number };
 type RenderPlan = { aspectRatio?: string; clipSequence?: SequenceItem[]; hook?: string; captions?: Caption[]; captionIdeas?: string[] };
+type RenderRequest = { orderId?: string; clips?: RenderClip[]; plan?: RenderPlan; outputType?: "draft" | "final" };
 
 async function resolveFfmpeg() {
   const candidates = [
@@ -64,16 +65,16 @@ function overlayFilters(font: string | null, hook?: string, caption?: string) {
   return filters.join(",");
 }
 
-async function renderSegment(input: string, output: string, start?: number, end?: number, hook?: string, caption?: string) {
+async function renderSegment(input: string, output: string, start?: number, end?: number, hook?: string, caption?: string, finalQuality = false) {
   const duration = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0.25, Math.min(30, (end as number) - (start as number))) : undefined;
   const font = await findFont();
   const baseFilters = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30";
   const overlays = overlayFilters(font, hook, caption);
   const videoFilter = overlays ? `${baseFilters},${overlays}` : baseFilters;
-  const args = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", output];
+  const args = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast", "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", "-movflags", "+faststart", output];
   try { await runFfmpeg(args); }
   catch (firstError) {
-    const fallback = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "mpeg4", "-q:v", "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", output];
+    const fallback = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "mpeg4", "-q:v", finalQuality ? "3" : "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", output];
     try { await runFfmpeg(fallback); }
     catch (secondError) {
       const a = firstError instanceof Error ? firstError.message : "H.264 failed."; const b = secondError instanceof Error ? secondError.message : "MPEG-4 failed.";
@@ -81,21 +82,22 @@ async function renderSegment(input: string, output: string, start?: number, end?
     }
   }
 }
-async function renderWhole(input: string, output: string, hook?: string, caption?: string) { await renderSegment(input, output, undefined, undefined, hook, caption); }
+async function renderWhole(input: string, output: string, hook?: string, caption?: string, finalQuality = false) { await renderSegment(input, output, undefined, undefined, hook, caption, finalQuality); }
 
 export async function POST(request: Request) {
   const tempDir = path.join(process.cwd(), "data", "render-tmp");
   try {
-    const body = await request.json() as { orderId?: string; clips?: RenderClip[]; plan?: RenderPlan };
+    const body = await request.json() as RenderRequest;
     if (!body.orderId || !Array.isArray(body.clips) || !body.clips.length) return NextResponse.json({ error: "Render data is incomplete." }, { status: 400 });
+    const outputType = body.outputType || "draft";
     const uploadDir = path.join(process.cwd(), "data", "uploads"); const renderDir = path.join(process.cwd(), "data", "renders");
     await mkdir(renderDir, { recursive: true }); await mkdir(tempDir, { recursive: true });
     const available = body.clips.map(clip => { const filename = filenameFromUrl(clip.url); const filePath = filename ? path.join(uploadDir, safeName(filename)) : ""; return { clip, filePath }; }).filter(item => item.filePath);
     const existing = [] as typeof available;
     for (const item of available) { try { await stat(item.filePath); existing.push(item); } catch { /* skip missing */ } }
-    if (!existing.length) return NextResponse.json({ error: "Uploaded footage could not be located on this server. Re-upload the footage to create a new draft." }, { status: 404 });
+    if (!existing.length) return NextResponse.json({ error: "Uploaded footage could not be located on this server. Re-upload the footage to create a new render." }, { status: 404 });
 
-    const outputName = `${body.orderId}-${crypto.randomUUID()}.mp4`; const outputPath = path.join(renderDir, outputName);
+    const outputName = `${body.orderId}-${outputType}-${crypto.randomUUID()}.mp4`; const outputPath = path.join(renderDir, outputName); const finalQuality = outputType === "final";
     const planParts = (body.plan?.clipSequence || []).map(item => {
       const clip = resolveClip(body.clips!, item.clip); if (!clip) return null; const found = existing.find(x => x.clip === clip); if (!found) return null;
       const timestamp = Number(item.timestampSeconds); const hasRange = Number.isFinite(item.startSeconds) && Number.isFinite(item.endSeconds) && Number(item.endSeconds) > Number(item.startSeconds);
@@ -111,7 +113,7 @@ export async function POST(request: Request) {
       try {
         for (let i = 0; i < planParts.length; i++) {
           const temp = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}-${i}.mp4`);
-          await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined));
+          await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined), finalQuality);
           tempFiles.push(temp);
         }
         if (tempFiles.length === 1) await writeFile(outputPath, await readFile(tempFiles[0]));
@@ -126,13 +128,13 @@ export async function POST(request: Request) {
 
     try { await stat(outputPath); }
     catch {
-      try { await renderWhole(existing[0].filePath, outputPath, hook, fallbackCaption); }
+      try { await renderWhole(existing[0].filePath, outputPath, hook, fallbackCaption, finalQuality); }
       catch (error) {
         const fallbackError = error instanceof Error ? error.message : "Full-footage render failed.";
-        return NextResponse.json({ error: `Draft render failed. ${fallbackError}${lastError ? ` AI cut attempt: ${lastError}` : ""}` }, { status: 500 });
+        return NextResponse.json({ error: `${outputType === "final" ? "Final" : "Draft"} render failed. ${fallbackError}${lastError ? ` AI cut attempt: ${lastError}` : ""}` }, { status: 500 });
       }
     }
     for (const file of tempFiles) await rm(file, { force: true });
-    return NextResponse.json({ ok: true, status: "ready", url: `/api/render/file?name=${encodeURIComponent(outputName)}`, outputName, usedAiCuts: planParts.length > 0 });
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Draft rendering failed." }, { status: 500 }); }
+    return NextResponse.json({ ok: true, status: "ready", url: `/api/render/file?name=${encodeURIComponent(outputName)}`, outputName, outputType, usedAiCuts: planParts.length > 0 });
+  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Render failed." }, { status: 500 }); }
 }
