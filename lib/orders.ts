@@ -6,7 +6,16 @@ export type AIPlan = {
   targetDurationSeconds: number;
   aspectRatio?: "9:16" | string;
   hook: string;
-  clipSequence: Array<{ clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; reason: string }>;
+  clipSequence: Array<{
+    clip: string;
+    startSeconds?: number;
+    endSeconds?: number;
+    timestampSeconds?: number;
+    reason: string;
+    speed?: number;
+    zoom?: number;
+    zoomDirection?: "in" | "out" | "none";
+  }>;
   captions?: Array<{ text: string; placement: string; style: string; startSeconds?: number; endSeconds?: number }>;
   captionIdeas?: string[];
   transitions?: Array<{ afterClip: string; type: string }>;
