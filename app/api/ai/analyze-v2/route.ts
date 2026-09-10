@@ -64,9 +64,6 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
   for (const frame of body.frames) durations.set(frame.clipName, Math.max(0, frame.durationSeconds));
   const knownClips = Array.from(durations.keys());
 
-  // Some model responses put their strongest selections in bestMoments but leave
-  // clipSequence empty. Convert those anchors into usable cuts instead of failing
-  // an otherwise valid AI response.
   const rawSequence = raw.clipSequence?.length
     ? raw.clipSequence
     : (raw.bestMoments || []).map(moment => ({
@@ -112,9 +109,9 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
     captions: [],
     captionIdeas: [],
     transitions: raw.transitions || [],
-    transitionDirection: raw.transitionDirection || "Purposeful hard cuts with momentum",
-    audioDirection: "Keep original source audio. No added music.",
-    colorDirection: raw.colorDirection || "Clean, natural and consistent.",
+    transitionDirection: raw.transitionDirection || "Use clean, invisible-feeling cuts that preserve visual and audio continuity.",
+    audioDirection: "Keep original source audio. No added music. Preserve continuity across clips.",
+    colorDirection: raw.colorDirection || "Clean, natural and consistent across all source clips.",
     ending: raw.ending || "End on the strongest meaningful moment; never use an accidental tail or phone UI."
   };
 }
@@ -124,10 +121,11 @@ function isPlaceholderKey(key: string | undefined) {
   const value = key.trim().toLowerCase();
   return value === "your_api_key_here" || value.includes("your_api_key") || value.includes("replace_with");
 }
+
 function transient(status: number) { return [429, 500, 502, 503, 504].includes(status); }
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-const prompt = (body: AnalyzeRequest, frameText: string) => `You are EDITIO's senior short-form video editor. Make an intentional edit from the actual supplied frames. You are NOT making a generic montage.
+const prompt = (body: AnalyzeRequest, frameText: string) => `You are EDITIO's senior short-form video editor. Make an intentional, professional Reel from the actual supplied frames. You are NOT making a generic montage.
 
 CREATOR INPUT
 Edit type: ${body.editType}
@@ -146,22 +144,36 @@ NON-NEGOTIABLE EDITING BRAIN
 1. Inspect every supplied frame before deciding the sequence.
 2. Story/payoff is more important than picking visually clear frames.
 3. Prefer a 10–24 second Reel, but NEVER pad weak footage. A short excellent Reel beats a long weak one.
-4. Usually use 4–8 purposeful segments. Use 0.8–4 seconds per segment based on actual action; do not force identical durations.
+4. Usually use 4–8 purposeful segments. Use 0.8–3 seconds per segment when the footage allows; do not force identical durations.
 5. Open with the strongest attention-grabbing visual. It may come from the middle/end of a source clip.
 6. Build a real progression: hook/setup → build/action → payoff/reaction/ending. Skip unsupported stages.
 7. Remove dead air, awkward pauses, repeated frames, empty/black frames, menus, screen recordings, phone UI, control-center overlays and accidental tails.
 8. Never repeat the same visual moment unless repetition has a clear editorial purpose.
 9. If two adjacent selections are visually almost identical, keep the stronger one and choose a different moment.
-10. Follow the CATEGORY and the final CREATIVE DIRECTION supplied by the creator. Treat the creative direction as an editable production brief, not a suggestion.
+10. Follow the CATEGORY and final CREATIVE DIRECTION exactly. Treat creative direction as an editable production brief, not a suggestion.
 11. Never invent people, dialogue, scores, products, locations, actions, results or events. Only claim what the frames support.
 12. Every clipSequence clip MUST be an EXACT filename from the FOOTAGE MAP. Never invent or abbreviate filenames.
 13. Every clipSequence item MUST have valid SOURCE-video startSeconds and endSeconds inside that clip's duration.
 14. timestampSeconds is the visual anchor for the chosen source moment.
 15. No captions or caption ideas. EDITIO currently has only an optional creator-written hook overlay.
-16. No music. Preserve original audio.
-17. If a source contains a phone UI/control center/screen recording, treat those frames as unusable even if they are sharp.
+16. No music. Preserve original source audio.
+17. If a source contains phone UI/control center/screen recording, treat those frames as unusable even if they are sharp.
 18. The last selected segment MUST be a meaningful payoff/ending. Never end on a screen recording or accidental footage.
 19. ${body.hookEnabled ? `Use the creator's exact hook text as the hook. Do not rewrite it or add claims.` : "Return an empty hook."}
+
+MULTI-CLIP CONTINUITY — CRITICAL
+20. If the creator uploads 2 or more clips, EDIT them as ONE continuous Reel, NOT as separate clips stitched together.
+21. Do NOT make the output feel like “Clip 1 finished → Clip 2 started → Clip 3 started.” The viewer should feel one intentional story from beginning to end.
+22. When multiple source clips are available, distribute selections across them when their content supports the story. Do not overuse one clip simply because it has more frames.
+23. Choose cut points that create a natural visual relationship between adjacent clips: matching action, movement, subject position, direction, framing, energy, or story progression.
+24. Prefer a natural match cut or clean hard cut over an obvious transition effect. The cut itself should feel intentional and almost invisible.
+25. Avoid joining two clips where the subject suddenly jumps position, camera orientation changes awkwardly, or motion continuity is obviously broken, unless that contrast is deliberately useful.
+26. If one clip ends while an action is developing and another clip contains the continuation/payoff, cut between them so the action feels continuous rather than restarting from zero.
+27. Keep pacing, framing and visual energy consistent across source clips. Use the same 9:16 composition logic throughout.
+28. If source clips have different framing/orientation, prefer selections that can be composed consistently in 9:16 rather than exposing the mismatch.
+29. Preserve natural audio continuity. Do not make every source clip sound like a separate video; choose cuts where source audio can continue naturally or where a clean audio cut is least noticeable.
+30. For 3 clips specifically, think of them as raw material for ONE story. Do not automatically give each clip equal screen time. Use only the strongest moments from each clip and merge them based on story/action continuity.
+31. The final result must feel like a single professionally edited Reel, not a slideshow, compilation, or three-video collage.
 
 CATEGORY PRIORITIES
 Cricket: when visible, prioritize reaction/setup → bowler/run-up → release → batting action/contact → result → meaningful reaction. Reject phone UI and dead tails. Never invent score, wicket, shot type or outcome.
@@ -182,12 +194,12 @@ RETURN JSON ONLY
   "targetDurationSeconds":number,
   "aspectRatio":"9:16",
   "hook":"exact creator hook or empty string",
-  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"specific editorial reason"}],
+  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"specific editorial reason and how this cut connects to the next"}],
   "captions":[],
   "captionIdeas":[],
   "transitions":[{"afterClip":"EXACT filename","type":"hard cut|match cut|quick cut"}],
-  "transitionDirection":"string",
-  "audioDirection":"Keep source audio only",
+  "transitionDirection":"describe how to make the cuts feel seamless and continuous",
+  "audioDirection":"Keep source audio only and describe continuity",
   "colorDirection":"string",
   "ending":"specific reason the final moment works"
 }`;
@@ -201,17 +213,21 @@ async function gemini(body: AnalyzeRequest, key: string, model: string) {
   const frames = body.frames.slice(0, 18);
   const frameText = frames.map((f, i) => `Frame ${i + 1}: clip=${f.clipName}, time=${f.timestampSeconds}s, duration=${f.durationSeconds}s`).join("\n");
   const parts: Array<Record<string, unknown>> = [{ text: prompt(body, frameText) }];
-  for (const frame of frames) { const part = geminiPart(frame.imageDataUrl); if (part) parts.push(part); }
+  for (const frame of frames) {
+    const part = geminiPart(frame.imageDataUrl);
+    if (part) parts.push(part);
+  }
 
   let last = "Gemini analysis failed.";
-  // High-demand responses are transient. Give the provider a little room to
-  // recover, but keep the retry bounded so one user action cannot loop forever.
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.12, responseMimeType: "application/json" } })
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.12, responseMimeType: "application/json" }
+        })
       });
       const data = await response.json();
       if (!response.ok) {
@@ -242,7 +258,19 @@ async function openai(body: AnalyzeRequest, key: string, model: string) {
   const frameText = frames.map((f, i) => `Frame ${i + 1}: clip=${f.clipName}, time=${f.timestampSeconds}s, duration=${f.durationSeconds}s`).join("\n");
   const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt(body, frameText) }];
   for (const frame of frames) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
-  const response = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model, temperature: 0.12, response_format: { type: "json_object" }, messages: [{ role: "system", content: "You are EDITIO's precise senior video editor. Return only JSON." }, { role: "user", content }] }) });
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model,
+      temperature: 0.12,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "You are EDITIO's precise senior video editor. Return only JSON." },
+        { role: "user", content }
+      ]
+    })
+  });
   const data = await response.json();
   if (!response.ok) throw new Error(data?.error?.message || `OpenAI failed (HTTP ${response.status}).`);
   const text = data?.choices?.[0]?.message?.content?.trim();
@@ -253,22 +281,28 @@ async function openai(body: AnalyzeRequest, key: string, model: string) {
 export async function POST(request: Request) {
   try {
     const body = await request.json() as AnalyzeRequest;
-    if (!body.orderId || !Array.isArray(body.frames) || !body.frames.length) return NextResponse.json({ error: "AI analysis needs an order and video frames." }, { status: 400 });
+    if (!body.orderId || !Array.isArray(body.frames) || !body.frames.length) {
+      return NextResponse.json({ error: "AI analysis needs an order and video frames." }, { status: 400 });
+    }
+
     const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").trim().toLowerCase();
     const fallback = process.env.EDITIO_AI_FALLBACK !== "false";
     const key = provider === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
     const model = provider === "openai" ? (process.env.OPENAI_MODEL || "gpt-4o-mini") : (process.env.GEMINI_MODEL || "gemini-3.8-flash");
+
     if (isPlaceholderKey(key)) {
       return NextResponse.json({ error: `${provider === "openai" ? "OpenAI" : "Gemini"} API key is missing. Add it to .env.local and restart the dev server.` }, { status: 500 });
     }
+
     try {
       const raw = provider === "openai" ? await openai(body, key!, model) : await gemini(body, key!, model);
       const plan = normalisePlan(raw, body);
-      if (!plan.clipSequence?.length) return NextResponse.json({ error: "AI could not find any usable video moments. Please use the single retry." }, { status: 422 });
+      if (!plan.clipSequence?.length) {
+        return NextResponse.json({ error: "AI could not find any usable video moments. Please use the single retry." }, { status: 422 });
+      }
       return NextResponse.json({ ok: true, plan, provider, model });
     } catch (error) {
       const message = error instanceof Error ? error.message : "AI analysis failed.";
-      if (fallback) return NextResponse.json({ error: message }, { status: 502 });
       return NextResponse.json({ error: message }, { status: 502 });
     }
   } catch (error) {
