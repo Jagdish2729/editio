@@ -8,6 +8,7 @@ export type EditioUser = {
 
 const USER_KEY = "editio_user";
 const SESSION_KEY = "editio_session";
+const AI_CREDIT_KEY = "editio_ai_credit_usage";
 
 async function hashPassword(password: string) {
   const data = new TextEncoder().encode(password);
@@ -15,10 +16,27 @@ async function hashPassword(password: string) {
   return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function accountKey(identifier: string) {
+  return identifier.trim().toLowerCase();
+}
+
+function readCreditUsage(): Record<string, boolean> {
+  if (typeof window === "undefined") return {};
+  try { return JSON.parse(localStorage.getItem(AI_CREDIT_KEY) || "{}") as Record<string, boolean>; } catch { return {}; }
+}
+
+function writeCreditUsage(usage: Record<string, boolean>) {
+  if (typeof window !== "undefined") localStorage.setItem(AI_CREDIT_KEY, JSON.stringify(usage));
+}
+
 export async function saveCreatorUser(user: Omit<EditioUser, "role" | "passwordHash">, password: string) {
   if (typeof window === "undefined") return;
   const passwordHash = await hashPassword(password);
-  localStorage.setItem(USER_KEY, JSON.stringify({ ...user, passwordHash, role: "creator", aiFreeCreditUsed: false }));
+  const key = accountKey(user.identifier);
+  const usage = readCreditUsage();
+  if (usage[key] === undefined) usage[key] = false;
+  writeCreditUsage(usage);
+  localStorage.setItem(USER_KEY, JSON.stringify({ ...user, passwordHash, role: "creator", aiFreeCreditUsed: usage[key] }));
 }
 
 export function getUser(): EditioUser | null {
@@ -43,13 +61,20 @@ export function hasSession() {
 }
 
 export function hasFreeAiCredit() {
-  return getUser()?.aiFreeCreditUsed !== true;
+  const user = getUser();
+  if (!user) return false;
+  return readCreditUsage()[accountKey(user.identifier)] !== true;
 }
 
 export function consumeFreeAiCredit() {
   if (typeof window === "undefined") return false;
   const user = getUser();
-  if (!user || user.aiFreeCreditUsed) return false;
+  if (!user) return false;
+  const usage = readCreditUsage();
+  const key = accountKey(user.identifier);
+  if (usage[key] === true) return false;
+  usage[key] = true;
+  writeCreditUsage(usage);
   localStorage.setItem(USER_KEY, JSON.stringify({ ...user, aiFreeCreditUsed: true }));
   return true;
 }
