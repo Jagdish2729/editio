@@ -57,8 +57,8 @@ function localDraftPlan(body: AnalyzeRequest) {
     aspectRatio: "9:16",
     hook: body.includeHook ? (body.brief ? body.brief.slice(0, 60) : "Wait for this") : "",
     clipSequence,
-    captions: body.includeCaptions ? [{ text: body.brief ? body.brief.slice(0, 55) : "Watch this", placement: "bottom", style: "bold", startSeconds: 0, endSeconds: 3 }] : [],
-    captionIdeas: body.includeCaptions ? [body.brief ? body.brief.slice(0, 55) : "Watch this"] : [],
+    captions: [],
+    captionIdeas: [],
     transitions: [],
     transitionDirection: "Hard cuts with momentum",
     audioDirection: "Keep source audio only. No music added by EDITIO.",
@@ -91,9 +91,6 @@ function resolveClipName(value: string | undefined, knownClips: string[]) {
   if (byKey) return byKey;
   const byStem = knownClips.find(name => clipStem(name) === stem);
   if (byStem) return byStem;
-
-  // Gemini sometimes returns a generic alias such as "clip 1". Resolve it only
-  // when the alias is unambiguous; this prevents a valid plan from being discarded.
   const match = key.match(/^(?:clip|video)[ _-]?(\d+)$/i);
   if (match) {
     const index = Number(match[1]) - 1;
@@ -107,7 +104,6 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
   const clipDurations = new Map<string, number>();
   for (const frame of body.frames) clipDurations.set(frame.clipName, Math.max(0, frame.durationSeconds));
   const knownClips = Array.from(clipDurations.keys());
-
   const sequence = (raw.clipSequence || [])
     .map(item => ({ ...item, clip: resolveClipName(item.clip, knownClips) || undefined }))
     .filter(item => item.clip)
@@ -133,16 +129,7 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
       };
     })
     .filter(item => Number(item.endSeconds) > Number(item.startSeconds));
-
   const target = sequence.reduce((sum, item) => sum + Number(item.endSeconds) - Number(item.startSeconds), 0);
-  const captions = body.includeCaptions ? (raw.captions || []).filter(item => item.text).slice(0, 5).map(item => ({
-    text: String(item.text).trim().slice(0, 90),
-    placement: ["top", "center", "bottom"].includes(String(item.placement)) ? String(item.placement) : "bottom",
-    style: item.style === "clean" ? "clean" : "bold",
-    startSeconds: Math.max(0, Number(item.startSeconds) || 0),
-    endSeconds: Math.max(0.5, Number(item.endSeconds) || 3)
-  })) : [];
-
   return {
     ...raw,
     visualSummary: raw.visualSummary || "AI-selected short-form edit from the supplied footage.",
@@ -150,8 +137,8 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
     aspectRatio: "9:16",
     hook: body.includeHook ? String(raw.hook || "").trim().slice(0, 70) : "",
     clipSequence: sequence,
-    captions,
-    captionIdeas: body.includeCaptions ? (raw.captionIdeas || []).slice(0, 6) : [],
+    captions: [],
+    captionIdeas: [],
     transitions: raw.transitions || [],
     transitionDirection: raw.transitionDirection || "Hard cuts with momentum",
     audioDirection: "Keep source audio only. No music added by EDITIO.",
@@ -162,54 +149,50 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
 
 const EDITOR_PROMPT = (body: AnalyzeRequest, frameText: string) => {
   const hookInstruction = body.includeHook
-    ? "Create one short hook (maximum 7 words) for the first 2–3 seconds. It must match the actual footage/brief; do not invent a claim."
+    ? "Use the creator's hook text EXACTLY as supplied in the brief. Do not rewrite it, add another hook, or invent a claim."
     : "Do not add an opening hook.";
-  const captionInstruction = body.includeCaptions
-    ? "Create 1–5 short caption lines. Their startSeconds/endSeconds are TIMELINE positions in the final reel, not source-video positions. Keep each line punchy and readable."
-    : "Do not add on-screen captions.";
-
-  return `You are EDITIO's senior short-form video editor. You are given sampled frames from the creator's actual uploaded clips. Your job is to design a genuinely useful first-cut Reel, not a generic montage.
+  return `You are EDITIO's senior short-form video editor. You are given sampled frames from the creator's actual uploaded clips. Design a genuinely useful first-cut Reel, not a generic montage.
 
 CREATOR REQUEST
 - Edit type: ${body.editType}
 - Format: ${body.format}
 - Vibe: ${body.vibe}
-- Brief: ${body.brief || "No extra brief. Use the selected vibe."}
+- Creative direction: ${body.brief || "No extra direction. Use the selected vibe."}
 - Reference: ${body.reference || "None"}
 - Hook requested: ${body.includeHook ? "YES" : "NO"}
-- Captions requested: ${body.includeCaptions ? "YES" : "NO"}
 
 FOOTAGE MAP
 ${frameText}
 
 EDITING RULES
-1. Visually inspect every supplied frame. Choose moments that are actually supported by the images.
-2. Build a 12–24 second short-form sequence when the footage allows it. Prefer 4–8 purposeful segments, usually 1.5–4 seconds each.
-3. Start with the strongest attention-grabbing visual, not automatically the first source clip.
-4. Remove obvious dead space. Vary shot selection and avoid repeating the same moment unless it serves the story.
-5. Use the creator's brief and vibe as the primary creative direction; do not blindly apply generic trends.
-6. Every clipSequence item MUST use the EXACT clip filename from the FOOTAGE MAP. Do not invent, abbreviate, rename, or translate filenames.
-7. Every clipSequence item MUST include startSeconds and endSeconds using the SOURCE clip's timeline. Keep them inside that clip's duration.
-8. timestampSeconds is the visual anchor for the selected moment.
-9. The sequence should have a clear opening, build/middle and satisfying ending. Explain why each chosen moment is there.
-10. Do not invent dialogue, actions, people, scores, locations or objects that are not visible in the supplied frames.
-11. No music. Preserve the creator's original audio.
-12. ${hookInstruction}
-13. ${captionInstruction}
-14. Keep captions away from the extreme bottom UI area. Prefer bottom/center with concise text.
-15. If the footage is weak, still make the best honest edit possible rather than fabricating a stronger moment.
+1. Inspect every supplied frame and make decisions from the actual footage.
+2. Build a 12–24 second Reel when the footage allows it. Prefer 4–8 purposeful segments, usually 1.0–3.5 seconds each.
+3. Start with the strongest attention-grabbing visual.
+4. Build a clear setup -> action -> payoff/story arc whenever the footage supports it.
+5. Remove dead space, repeated visuals, weak reaction shots, black frames, phone UI, screen recordings, menus, control centers, accidental camera-down footage and obvious unusable tails.
+6. Avoid using two near-identical moments back-to-back.
+7. For sports footage, prioritize the actual action: setup, run-up/approach, release, contact/action, result and reaction when visible. Never claim a score/result that is not visible.
+8. For fashion/beauty, prioritize reveal, strongest pose/detail, movement and final look. For travel, prioritize establishing shot, movement, location detail and strongest payoff. For food, prioritize preparation/action, hero shot and final result. For fitness, prioritize setup, movement peak and result. For gaming, prioritize gameplay action and payoff. These are guidelines, not excuses to invent footage.
+9. The creator's custom direction is authoritative and may override category defaults.
+10. Every clipSequence item MUST use the EXACT clip filename from the FOOTAGE MAP. Do not invent, abbreviate or rename filenames.
+11. Every clipSequence item MUST include source startSeconds and endSeconds inside that clip's duration.
+12. timestampSeconds is the visual anchor for the selected moment.
+13. Do not invent dialogue, actions, people, scores, locations or objects.
+14. Preserve original source audio only. No music.
+15. ${hookInstruction}
+16. End on a meaningful visual payoff, never a screen recording/control center/dead frame.
 
 RETURN JSON ONLY:
 {
-  "visualSummary":"brief description of what the footage supports",
-  "bestMoments":[{"clip":"EXACT filename from FOOTAGE MAP","timestampSeconds":number,"reason":"why this moment is strong"}],
+  "visualSummary":"brief description",
+  "bestMoments":[{"clip":"EXACT filename","timestampSeconds":number,"reason":"why this moment is strong"}],
   "targetDurationSeconds":number,
   "aspectRatio":"9:16",
-  "hook":"short string or empty",
-  "clipSequence":[{"clip":"EXACT filename from FOOTAGE MAP","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"editing reason"}],
-  "captions":[{"text":"string","placement":"top|center|bottom","style":"bold|clean","startSeconds":number,"endSeconds":number}],
-  "captionIdeas":["string"],
-  "transitions":[{"afterClip":"EXACT filename from FOOTAGE MAP","type":"hard cut|match cut|quick cut"}],
+  "hook":"string or empty",
+  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"editing reason"}],
+  "captions":[],
+  "captionIdeas":[],
+  "transitions":[{"afterClip":"EXACT filename","type":"hard cut|match cut|quick cut"}],
   "transitionDirection":"string",
   "audioDirection":"Keep source audio only",
   "colorDirection":"string",
@@ -251,24 +234,22 @@ async function analyzeWithGemini(body: AnalyzeRequest, apiKey: string, model: st
           generationConfig: { temperature: 0.15, responseMimeType: "application/json" }
         })
       });
-
       const data = await response.json();
       if (!response.ok) {
         lastError = data?.error?.message || `Gemini analysis failed (HTTP ${response.status}).`;
         if (attempt === 1 && isTransientStatus(response.status)) {
-          await sleep(1200);
+          await sleep(response.status === 429 ? 4000 : 2500);
           continue;
         }
         throw new Error(lastError);
       }
-
       const text = data?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("").trim();
       if (!text) throw new Error("Gemini returned an empty analysis.");
       return parseJson(text);
     } catch (error) {
       lastError = error instanceof Error ? error.message : lastError;
       if (attempt === 1 && /fetch failed|timed out|timeout/i.test(lastError)) {
-        await sleep(1200);
+        await sleep(2500);
         continue;
       }
       throw new Error(lastError);
@@ -282,7 +263,6 @@ async function analyzeWithOpenAI(body: AnalyzeRequest, apiKey: string, model: st
   const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
   const content: Array<Record<string, unknown>> = [{ type: "text", text: EDITOR_PROMPT(body, frameText) }];
   for (const frame of frameList) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
-
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -296,7 +276,6 @@ async function analyzeWithOpenAI(body: AnalyzeRequest, apiKey: string, model: st
       ]
     })
   });
-
   const data = await response.json();
   if (!response.ok) throw new Error(data?.error?.message || "OpenAI analysis failed.");
   const text = data?.choices?.[0]?.message?.content;
@@ -310,42 +289,26 @@ export async function POST(request: Request) {
     if (!body.orderId || !body.format || !body.vibe || !body.frames?.length) {
       return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
     }
-
     const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").trim().toLowerCase();
     const useLocalFallback = process.env.EDITIO_AI_FALLBACK !== "false";
     const apiKey = provider === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
-
     if (isPlaceholderKey(apiKey)) {
       if (!useLocalFallback) {
-        return NextResponse.json({
-          error: provider === "openai"
-            ? "OPENAI_API_KEY is not configured. Add a real API key to .env.local."
-            : "GEMINI_API_KEY is not configured. Add a real Gemini API key to .env.local."
-        }, { status: 503 });
+        return NextResponse.json({ error: provider === "openai" ? "OPENAI_API_KEY is not configured. Add a real API key to .env.local." : "GEMINI_API_KEY is not configured. Add a real Gemini API key to .env.local." }, { status: 503 });
       }
       return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", provider, fallback: true });
     }
-
-    const model = provider === "openai"
-      ? (process.env.OPENAI_MODEL || "gpt-4o-mini")
-      : (process.env.GEMINI_MODEL || "gemini-3.8-flash");
-
+    const model = provider === "openai" ? (process.env.OPENAI_MODEL || "gpt-4o-mini") : (process.env.GEMINI_MODEL || "gemini-3.8-flash");
     try {
-      const rawPlan = provider === "openai"
-        ? await analyzeWithOpenAI(body, apiKey!, model)
-        : await analyzeWithGemini(body, apiKey!, model);
+      const rawPlan = provider === "openai" ? await analyzeWithOpenAI(body, apiKey!, model) : await analyzeWithGemini(body, apiKey!, model);
       const plan = normalisePlan(rawPlan, body);
-
-      if (!plan.clipSequence?.length) {
-        return NextResponse.json({ error: "AI returned a plan, but no usable video cuts could be mapped to the uploaded footage. Please retry the AI edit." }, { status: 422 });
-      }
-
+      if (!plan.clipSequence?.length) return NextResponse.json({ error: "AI returned a plan, but no usable video cuts could be mapped to the uploaded footage. Please retry the AI edit." }, { status: 422 });
       return NextResponse.json({ ok: true, plan, model, provider, fallback: false });
     } catch (error) {
-      if (useLocalFallback) {
-        return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", provider, fallback: true, aiError: error instanceof Error ? error.message : "AI analysis failed." });
-      }
-      return NextResponse.json({ error: error instanceof Error ? error.message : "AI analysis failed." }, { status: 502 });
+      const message = error instanceof Error ? error.message : "AI analysis failed.";
+      if (useLocalFallback) return NextResponse.json({ ok: true, plan: localDraftPlan(body), model: "editio-local-draft-planner", provider, fallback: true, aiError: message });
+      const busy = /high demand|spikes in demand|too many requests|rate limit|quota|429/i.test(message);
+      return NextResponse.json({ error: busy ? "Gemini is temporarily busy. EDITIO already waited and retried once. Please try your available EDITIO retry again in a moment." : message }, { status: busy ? 503 : 502 });
     }
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "AI analysis failed." }, { status: 500 });
