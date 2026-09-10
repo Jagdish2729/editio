@@ -24,6 +24,10 @@ export type EditOrder = {
   modeLabel: string;
   format: string;
   vibe: string;
+  category?: string;
+  creativeDirection?: string;
+  hookEnabled?: boolean;
+  hookText?: string;
   brief: string;
   reference: string;
   includeHook?: boolean;
@@ -56,7 +60,6 @@ export function getOrders(): EditOrder[] {
   if (typeof window === "undefined") return [];
   const accountKey = getAccountKey();
   if (!accountKey) return [];
-
   try {
     const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
     return allOrders.filter(order => order.creatorIdentifier === accountKey);
@@ -69,7 +72,6 @@ export function createOrder(order: Omit<EditOrder, "id" | "createdAt" | "status"
   if (typeof window === "undefined") return null;
   const accountKey = getAccountKey();
   if (!accountKey) return null;
-
   const next: EditOrder = {
     ...order,
     creatorIdentifier: accountKey,
@@ -77,7 +79,6 @@ export function createOrder(order: Omit<EditOrder, "id" | "createdAt" | "status"
     status: "submitted",
     createdAt: new Date().toISOString(),
   };
-
   try {
     const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
     localStorage.setItem(ORDERS_KEY, JSON.stringify([next, ...allOrders]));
@@ -91,14 +92,9 @@ export function updateOrder(id: string, patch: Partial<EditOrder>) {
   if (typeof window === "undefined") return null;
   const accountKey = getAccountKey();
   if (!accountKey) return null;
-
   try {
     const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
-    const next = allOrders.map(order =>
-      order.id === id && order.creatorIdentifier === accountKey
-        ? { ...order, ...patch }
-        : order
-    );
+    const next = allOrders.map(order => order.id === id && order.creatorIdentifier === accountKey ? { ...order, ...patch } : order);
     localStorage.setItem(ORDERS_KEY, JSON.stringify(next));
     return next.find(order => order.id === id && order.creatorIdentifier === accountKey) || null;
   } catch {
