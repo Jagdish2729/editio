@@ -22,7 +22,16 @@ type RawPlan = {
   targetDurationSeconds?: number;
   aspectRatio?: string;
   hook?: string;
-  clipSequence?: Array<{ clip?: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; reason?: string }>;
+  clipSequence?: Array<{
+    clip?: string;
+    startSeconds?: number;
+    endSeconds?: number;
+    timestampSeconds?: number;
+    reason?: string;
+    speed?: number;
+    zoom?: number;
+    zoomDirection?: "in" | "out" | "none";
+  }>;
   captions?: unknown[];
   captionIdeas?: string[];
   transitions?: Array<{ afterClip?: string; type?: string }>;
@@ -88,23 +97,33 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
       }
       start = Math.max(0, Math.min(start, Math.max(0, duration - 0.3)));
       end = Math.max(start + 0.75, Math.min(end, duration || end));
+
+      const requestedSpeed = Number(item.speed);
+      const speed = Number.isFinite(requestedSpeed) ? Math.max(0.65, Math.min(1.35, requestedSpeed)) : 1;
+      const requestedZoom = Number(item.zoom);
+      const zoom = Number.isFinite(requestedZoom) ? Math.max(1, Math.min(1.12, requestedZoom)) : 1;
+      const zoomDirection = item.zoomDirection === "in" || item.zoomDirection === "out" ? item.zoomDirection : "none";
+
       return {
         ...item,
         startSeconds: Number(start.toFixed(2)),
         endSeconds: Number(end.toFixed(2)),
         timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
-        reason: item.reason || "Selected for the story."
+        reason: item.reason || "Selected for the story.",
+        speed: Number(speed.toFixed(2)),
+        zoom: Number(zoom.toFixed(2)),
+        zoomDirection
       };
     })
     .filter(item => Number(item.endSeconds) > Number(item.startSeconds));
 
-  const total = sequence.reduce((sum, item) => sum + Number(item.endSeconds) - Number(item.startSeconds), 0);
+  const total = sequence.reduce((sum, item) => sum + ((Number(item.endSeconds) - Number(item.startSeconds)) / Math.max(0.65, Number(item.speed) || 1)), 0);
   return {
     visualSummary: raw.visualSummary || "AI-selected first-cut Reel based on the supplied footage.",
     bestMoments: (raw.bestMoments || []).slice(0, 8).map(item => ({ ...item, clip: resolveClipName(item.clip, knownClips) || item.clip })).filter(item => knownClips.includes(item.clip || "")) as RawPlan["bestMoments"],
     targetDurationSeconds: Math.max(6, Math.min(24, Math.round(total || Number(raw.targetDurationSeconds) || 12))),
     aspectRatio: "9:16",
-    hook: body.hookEnabled ? (body.hookText || "").trim().slice(0, 90) : "",
+    hook: body.hookEnabled && (body.hookText || "").trim().split(/\s+/).length >= 4 ? (body.hookText || "").trim().slice(0, 90) : "",
     clipSequence: sequence,
     captions: [],
     captionIdeas: [],
@@ -121,7 +140,6 @@ function isPlaceholderKey(key: string | undefined) {
   const value = key.trim().toLowerCase();
   return value === "your_api_key_here" || value.includes("your_api_key") || value.includes("replace_with");
 }
-
 function transient(status: number) { return [429, 500, 502, 503, 504].includes(status); }
 function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -159,29 +177,40 @@ NON-NEGOTIABLE EDITING BRAIN
 16. No music. Preserve original source audio.
 17. If a source contains phone UI/control center/screen recording, treat those frames as unusable even if they are sharp.
 18. The last selected segment MUST be a meaningful payoff/ending. Never end on a screen recording or accidental footage.
-19. ${body.hookEnabled ? `Use the creator's exact hook text as the hook. Do not rewrite it or add claims.` : "Return an empty hook."}
+19. ${body.hookEnabled ? `Use the creator's hook text only if it is a meaningful multi-word hook (4+ words). If it is very short/simple, return an empty hook instead. Never rewrite it.` : "Return an empty hook."}
+
+PRO EDITING EFFECTS — CRITICAL
+20. Do NOT just join normal video clips. The final Reel must have intentional editorial movement and rhythm.
+21. Use speed changes selectively when they improve the moment: slow down important impact/reaction/action moments (typically 0.65–0.85x), and speed up dead/low-energy movement (typically 1.10–1.30x). Keep normal moments at 1.0x.
+22. Use subtle punch-in/punch-out zooms when they improve focus. Prefer 1.03–1.10x; never use exaggerated zooms that look cheap or distracting.
+23. For zoomDirection, use "in" for emphasis/build-up, "out" for release/context, and "none" when no zoom is needed.
+24. Do NOT apply effects to every segment. Effects should have editorial purpose. A good Reel may have 1–3 speed changes and 1–3 subtle zoom moments, not effects everywhere.
+25. For sports/action, consider slow motion around the key action/contact/reaction and slightly faster pacing around setup/run-up when supported by the footage.
+26. Never invent an action just because a speed or zoom effect would look cool. Effects must follow what is actually visible.
+27. The edit should feel designed: varied shot duration + purposeful speed + subtle reframing + clean cuts.
+28. Avoid over-editing. No flashy transitions, spinning effects, random shakes, excessive zooms, or TikTok-style gimmicks unless explicitly requested.
 
 MULTI-CLIP CONTINUITY — CRITICAL
-20. If the creator uploads 2 or more clips, EDIT them as ONE continuous Reel, NOT as separate clips stitched together.
-21. Do NOT make the output feel like “Clip 1 finished → Clip 2 started → Clip 3 started.” The viewer should feel one intentional story from beginning to end.
-22. When multiple source clips are available, distribute selections across them when their content supports the story. Do not overuse one clip simply because it has more frames.
-23. Choose cut points that create a natural visual relationship between adjacent clips: matching action, movement, subject position, direction, framing, energy, or story progression.
-24. Prefer a natural match cut or clean hard cut over an obvious transition effect. The cut itself should feel intentional and almost invisible.
-25. Avoid joining two clips where the subject suddenly jumps position, camera orientation changes awkwardly, or motion continuity is obviously broken, unless that contrast is deliberately useful.
-26. If one clip ends while an action is developing and another clip contains the continuation/payoff, cut between them so the action feels continuous rather than restarting from zero.
-27. Keep pacing, framing and visual energy consistent across source clips. Use the same 9:16 composition logic throughout.
-28. If source clips have different framing/orientation, prefer selections that can be composed consistently in 9:16 rather than exposing the mismatch.
-29. Preserve natural audio continuity. Do not make every source clip sound like a separate video; choose cuts where source audio can continue naturally or where a clean audio cut is least noticeable.
-30. For 3 clips specifically, think of them as raw material for ONE story. Do not automatically give each clip equal screen time. Use only the strongest moments from each clip and merge them based on story/action continuity.
-31. The final result must feel like a single professionally edited Reel, not a slideshow, compilation, or three-video collage.
+29. If the creator uploads 2 or more clips, EDIT them as ONE continuous Reel, NOT as separate clips stitched together.
+30. Do NOT make the output feel like “Clip 1 finished → Clip 2 started → Clip 3 started.” The viewer should feel one intentional story from beginning to end.
+31. When multiple source clips are available, distribute selections across them when their content supports the story. Do not overuse one clip simply because it has more frames.
+32. Choose cut points that create a natural visual relationship between adjacent clips: matching action, movement, subject position, direction, framing, energy, or story progression.
+33. Prefer a natural match cut or clean hard cut over an obvious transition effect. The cut itself should feel intentional and almost invisible.
+34. Avoid joining two clips where the subject suddenly jumps position, camera orientation changes awkwardly, or motion continuity is obviously broken, unless that contrast is deliberately useful.
+35. If one clip ends while an action is developing and another clip contains the continuation/payoff, cut between them so the action feels continuous rather than restarting from zero.
+36. Keep pacing, framing and visual energy consistent across source clips. Use the same 9:16 composition logic throughout.
+37. If source clips have different framing/orientation, prefer selections that can be composed consistently in 9:16 rather than exposing the mismatch.
+38. Preserve natural audio continuity. Do not make every source clip sound like a separate video; choose cuts where source audio can continue naturally or where a clean audio cut is least noticeable.
+39. For 3 clips specifically, think of them as raw material for ONE story. Do not automatically give each clip equal screen time. Use only the strongest moments from each clip and merge them based on story/action continuity.
+40. The final result must feel like a single professionally edited Reel, not a slideshow, compilation, or three-video collage.
 
 CATEGORY PRIORITIES
-Cricket: when visible, prioritize reaction/setup → bowler/run-up → release → batting action/contact → result → meaningful reaction. Reject phone UI and dead tails. Never invent score, wicket, shot type or outcome.
-Fashion: outfit reveal → movement → detail → strongest final look.
-Travel: establishing view → movement/experience → location detail → memorable ending.
-Food: preparation/action → texture/detail → reveal → hero shot.
-Fitness: setup → strongest movement/effort → result/reaction.
-Beauty: before/application → action/detail → finished look.
+Cricket: when visible, prioritize reaction/setup → bowler/run-up → release → batting action/contact → result → meaningful reaction. Use slow motion selectively at release/contact/result when the frames support it; use subtle punch-in on key action or reaction. Reject phone UI and dead tails. Never invent score, wicket, shot type or outcome.
+Fashion: outfit reveal → movement → detail → strongest final look. Use subtle punch-ins on details and slight speed changes for transitions/movement when useful.
+Travel: establishing view → movement/experience → location detail → memorable ending. Use gentle speed ramps and subtle zooms only where they enhance scale/motion.
+Food: preparation/action → texture/detail → reveal → hero shot. Use subtle punch-ins on texture/detail and slight speed-up for repetitive preparation.
+Fitness: setup → strongest movement/effort → result/reaction. Use slow motion for the strongest rep/action when supported and faster setup pacing when useful.
+Beauty: before/application → action/detail → finished look. Use subtle punch-ins for details and controlled pacing.
 Lifestyle: visually interesting moments forming a natural mini-story.
 Gaming: gameplay action → tension → clear payoff/reaction; reject menus/UI-only frames.
 Business: useful/product/work/talking moments → credible payoff; no invented claims.
@@ -193,8 +222,8 @@ RETURN JSON ONLY
   "bestMoments":[{"clip":"EXACT filename","timestampSeconds":number,"reason":"specific reason"}],
   "targetDurationSeconds":number,
   "aspectRatio":"9:16",
-  "hook":"exact creator hook or empty string",
-  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"specific editorial reason and how this cut connects to the next"}],
+  "hook":"meaningful creator hook or empty string",
+  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"speed":number,"zoom":number,"zoomDirection":"in|out|none","reason":"specific editorial reason and how this cut connects to the next"}],
   "captions":[],
   "captionIdeas":[],
   "transitions":[{"afterClip":"EXACT filename","type":"hard cut|match cut|quick cut"}],
@@ -303,6 +332,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true, plan, provider, model });
     } catch (error) {
       const message = error instanceof Error ? error.message : "AI analysis failed.";
+      if (fallback) return NextResponse.json({ error: message }, { status: 502 });
       return NextResponse.json({ error: message }, { status: 502 });
     }
   } catch (error) {
