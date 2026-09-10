@@ -1,385 +1,313 @@
 import { NextResponse } from "next/server";
-import type { VideoFrame } from "../../../../lib/video-analysis";
 
 export const runtime = "nodejs";
 
-type AnalyzeRequest = {
-  orderId: string;
-  editType: string;
-  format: string;
-  vibe: string;
-  category: string;
-  creativeDirection: string;
-  hookEnabled?: boolean;
-  hookText?: string;
-  reference?: string;
-  frames: VideoFrame[];
-};
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const transientStatuses = new Set([429, 500, 502, 503, 504]);
 
-type Moment = { clip?: string; timestampSeconds?: number; reason?: string };
-type SequenceItem = {
-  clip?: string;
-  startSeconds?: number;
-  endSeconds?: number;
-  timestampSeconds?: number;
-  reason?: string;
-  speed?: number;
-  zoom?: number;
-  zoomDirection?: "in" | "out" | "none";
-};
+type Frame = { clipName: string; timestampSeconds: number; duration: number; imageDataUrl: string };
 type RawPlan = {
   visualSummary?: string;
-  heroMoment?: Moment;
-  bestMoments?: Moment[];
+  heroMoment?: { clip: string; timestampSeconds: number; reason: string };
+  bestMoments?: Array<{ clip: string; timestampSeconds: number; reason: string }>;
   targetDurationSeconds?: number;
   aspectRatio?: string;
   hook?: string;
-  clipSequence?: SequenceItem[];
-  captions?: unknown[];
-  captionIdeas?: string[];
-  transitions?: Array<{ afterClip?: string; type?: string }>;
-  transitionDirection?: string;
+  hookEnabled?: boolean;
+  clipSequence?: Array<{
+    clip: string;
+    startSeconds?: number;
+    endSeconds?: number;
+    timestampSeconds?: number;
+    reason?: string;
+    speed?: number;
+    zoom?: number;
+    zoomDirection?: "in" | "out" | "none";
+    isHero?: boolean;
+  }>;
+  textOverlays?: Array<{ text: string; startSeconds?: number; endSeconds?: number; kind?: string; position?: string; style?: string; animation?: string }>;
+  captions?: Array<{ text: string; placement: string; style: string; startSeconds?: number; endSeconds?: number }>;
+  transitions?: Array<{ afterClip: string; type: string }>;
   audioDirection?: string;
+  musicMood?: string;
+  musicIntensity?: number;
+  sfx?: Array<{ timeSeconds: number; type: string; durationSeconds?: number; intensity?: number }>;
   colorDirection?: string;
+  colorPreset?: string;
   ending?: string;
+  coverText?: string;
+  socialCaption?: string;
+  hashtags?: string[];
 };
 
-function parseJson(text: string): RawPlan {
-  const cleaned = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-  return JSON.parse(cleaned) as RawPlan;
+type NormalisedPlan = {
+  visualSummary: string;
+  heroMoment?: { clip: string; timestampSeconds: number; reason: string };
+  bestMoments: Array<{ clip: string; timestampSeconds: number; reason: string }>;
+  targetDurationSeconds: number;
+  aspectRatio: string;
+  hook: string;
+  hookEnabled: boolean;
+  clipSequence: Array<{
+    clip: string;
+    startSeconds: number;
+    endSeconds: number;
+    timestampSeconds: number;
+    reason: string;
+    speed: number;
+    zoom: number;
+    zoomDirection: "in" | "out" | "none";
+    isHero?: boolean;
+  }>;
+  textOverlays: Array<{ text: string; startSeconds: number; endSeconds: number; kind: "hook" | "editorial" | "caption" | "ending"; position: "top" | "center" | "bottom"; style: "clean" | "bold" | "cinematic" | "funny" | "sports"; animation: "pop" | "fade" | "slide" | "none" }>;
+  captions: Array<{ text: string; placement: string; style: string; startSeconds?: number; endSeconds?: number }>;
+  transitions: Array<{ afterClip: string; type: string }>;
+  audioDirection: string;
+  musicMood: "none" | "hype" | "cinematic" | "chill" | "funny" | "emotional";
+  musicIntensity: number;
+  sfx: Array<{ timeSeconds: number; type: "impact" | "whoosh" | "pop" | "record-scratch" | "crowd" | "ding"; durationSeconds: number; intensity: number }>;
+  colorDirection: string;
+  colorPreset: "natural" | "crisp" | "warm" | "cinematic" | "punchy";
+  ending: string;
+  coverText: string;
+  socialCaption: string;
+  hashtags: string[];
+};
+
+function cleanJson(text: string) {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("AI returned an invalid edit plan.");
+  return JSON.parse(trimmed.slice(start, end + 1)) as RawPlan;
 }
-function clipKey(value: string) { return value.trim().toLowerCase().replace(/\\/g, "/").split("/").pop() || ""; }
-function clipStem(value: string) { return clipKey(value).replace(/\.[a-z0-9]{2,5}$/i, ""); }
-function resolveClipName(value: string | undefined, knownClips: string[]) {
-  if (!value) return null;
-  const exact = knownClips.find(name => name === value); if (exact) return exact;
-  const key = clipKey(value); const byKey = knownClips.find(name => clipKey(name) === key); if (byKey) return byKey;
-  const stem = clipStem(value); const byStem = knownClips.find(name => clipStem(name) === stem); if (byStem) return byStem;
-  const match = key.match(/^(?:clip|video)[ _-]?(\d+)$/i);
-  if (match) { const index = Number(match[1]) - 1; if (knownClips[index]) return knownClips[index]; }
-  return knownClips.length === 1 ? knownClips[0] : null;
-}
-function selectVisionFrames(allFrames: VideoFrame[], maxFrames = 18) {
-  const groups = Array.from(new Set(allFrames.map(frame => frame.clipName))).map(name => allFrames.filter(frame => frame.clipName === name));
-  if (groups.length <= 1) return allFrames.slice(0, maxFrames);
-  const selected: VideoFrame[] = [];
-  const perGroup = Math.max(1, Math.floor(maxFrames / groups.length));
-  for (const group of groups) {
-    for (let i = 0; i < Math.min(perGroup, group.length); i++) selected.push(group[Math.min(group.length - 1, Math.floor((i * group.length) / Math.min(perGroup, group.length)))]);
+
+function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, Number.isFinite(n) ? n : min)); }
+function normName(name: string) { return name.trim().toLowerCase().replace(/\\.[a-z0-9]+$/i, "").replace(/[^a-z0-9]+/g, ""); }
+
+function resolveClip(name: string, frames: Frame[]) {
+  const exact = frames.find(f => f.clipName.toLowerCase() === name.toLowerCase());
+  if (exact) return exact.clipName;
+  const n = normName(name);
+  const byStem = frames.find(f => normName(f.clipName) === n || normName(f.clipName).includes(n) || n.includes(normName(f.clipName)));
+  if (byStem) return byStem.clipName;
+  const number = name.match(/(?:clip|video|file)[^0-9]*(\\d+)/i)?.[1];
+  if (number) {
+    const match = frames.find(f => (f.clipName.match(/(\\d+)/)?.[1] || "") === number);
+    if (match) return match.clipName;
   }
-  let cursor = 0;
-  while (selected.length < maxFrames && cursor < maxFrames * groups.length * 2) {
-    const group = groups[cursor % groups.length];
-    const index = Math.floor(((cursor + 1) * group.length) / (Math.ceil(maxFrames / groups.length) + 1));
-    const frame = group[Math.min(group.length - 1, Math.max(0, index))];
-    if (frame && !selected.includes(frame)) selected.push(frame);
-    cursor++;
-  }
-  return selected.slice(0, maxFrames);
+  return frames[0]?.clipName || name;
 }
 
-function isCricket(body: AnalyzeRequest) { return /cricket|sports?/i.test(`${body.category} ${body.creativeDirection}`); }
-function eventLooksLikeHero(reason = "") { return /wicket|dismiss|catch|caught|boundary|six|four|goal|impact|result|out/i.test(reason); }
+function durationFor(clip: string, frames: Frame[]) {
+  return Math.max(0.5, frames.filter(f => f.clipName === clip).reduce((m, f) => Math.max(m, f.duration), 0.5));
+}
 
-function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
-  const durations = new Map<string, number>();
-  for (const frame of body.frames) durations.set(frame.clipName, Math.max(0, frame.durationSeconds));
-  const knownClips = Array.from(durations.keys());
-  const rawSequence = raw.clipSequence?.length
-    ? raw.clipSequence
-    : (raw.bestMoments || []).map(moment => ({ clip: moment.clip, timestampSeconds: moment.timestampSeconds, reason: moment.reason || "Selected as a strong moment." }));
+function normalisePlan(raw: RawPlan, frames: Frame[], category: string, hookEnabled: boolean): NormalisedPlan {
+  const firstClip = frames[0]?.clipName || "clip-1";
+  const heroRaw = raw.heroMoment;
+  const hero = heroRaw ? { clip: resolveClip(heroRaw.clip, frames), timestampSeconds: heroRaw.timestampSeconds, reason: heroRaw.reason || "Main moment" } : undefined;
+  if (hero) hero.timestampSeconds = clamp(hero.timestampSeconds, 0, Math.max(0, durationFor(hero.clip, frames) - 0.05));
 
-  const makeItem = (item: SequenceItem) => {
-    const clip = resolveClipName(item.clip, knownClips);
-    if (!clip) return null;
-    const duration = durations.get(clip) || 0;
-    const anchor = Number(item.timestampSeconds);
-    let start = Number(item.startSeconds), end = Number(item.endSeconds);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-      const safeAnchor = Number.isFinite(anchor) ? anchor : duration * 0.5;
-      start = Math.max(0, safeAnchor - 1.1); end = Math.min(duration || safeAnchor + 1.8, safeAnchor + 1.8);
-    }
-    start = Math.max(0, Math.min(start, Math.max(0, duration - 0.25)));
-    end = Math.max(start + 0.45, Math.min(end, duration || end));
-    const requestedSpeed = Number(item.speed);
-    const speed = Number.isFinite(requestedSpeed) ? Math.max(0.65, Math.min(1.35, requestedSpeed)) : 1;
-    const requestedZoom = Number(item.zoom);
-    const zoom = Number.isFinite(requestedZoom) ? Math.max(1, Math.min(1.12, requestedZoom)) : 1;
-    const zoomDirection = item.zoomDirection === "in" || item.zoomDirection === "out" ? item.zoomDirection : "none";
+  const sequence = (raw.clipSequence || []).map(item => {
+    const clip = resolveClip(item.clip || firstClip, frames);
+    const duration = durationFor(clip, frames);
+    let start = Number.isFinite(item.startSeconds) ? Number(item.startSeconds) : Number(item.timestampSeconds ?? 0);
+    let end = Number.isFinite(item.endSeconds) ? Number(item.endSeconds) : start + 1.2;
+    if (end <= start) end = start + 1.2;
+    start = clamp(start, 0, Math.max(0, duration - 0.08));
+    end = clamp(end, start + 0.25, duration);
     return {
-      ...item,
-      clip,
-      startSeconds: Number(start.toFixed(2)),
-      endSeconds: Number(end.toFixed(2)),
-      timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
-      reason: item.reason || "Selected for the story.",
-      speed: Number(speed.toFixed(2)), zoom: Number(zoom.toFixed(2)), zoomDirection,
+      clip, startSeconds: start, endSeconds: end, timestampSeconds: (start + end) / 2,
+      reason: item.reason || "Best usable moment", speed: clamp(Number(item.speed ?? 1), 0.65, 1.35),
+      zoom: clamp(Number(item.zoom ?? 1), 0.88, 1.12), zoomDirection: item.zoomDirection || "none", isHero: Boolean(item.isHero)
     };
-  };
+  }).filter(x => x.endSeconds - x.startSeconds >= 0.25);
 
-  let sequence = rawSequence.map(makeItem).filter(Boolean) as SequenceItem[];
-  const heroClip = resolveClipName(raw.heroMoment?.clip, knownClips);
-  const heroTime = Number(raw.heroMoment?.timestampSeconds);
-  const cricket = isCricket(body);
-  const heroReason = raw.heroMoment?.reason || "Mandatory hero/payoff moment.";
+  if (!sequence.length) {
+    const fallback = hero || { clip: firstClip, timestampSeconds: 0.5, reason: "Fallback usable moment" };
+    const d = durationFor(fallback.clip, frames);
+    sequence.push({ clip: fallback.clip, startSeconds: clamp(fallback.timestampSeconds - 0.6, 0, Math.max(0, d - 0.8)), endSeconds: clamp(fallback.timestampSeconds + 0.8, 0.8, d), timestampSeconds: fallback.timestampSeconds, reason: fallback.reason, speed: 1, zoom: 1, zoomDirection: "none", isHero: Boolean(hero) });
+  }
 
-  if (heroClip && Number.isFinite(heroTime)) {
-    // Replace whatever tiny/poor segment the model chose around the hero with a
-    // proper event package: build-up + impact + post-event breathing room.
-    const heroStart = Math.max(0, heroTime - (cricket ? 1.35 : 1.1));
-    const heroEnd = Math.min(durations.get(heroClip) || heroTime + 1.2, heroTime + (cricket ? 1.15 : 1.0));
-    const hero = makeItem({ clip: heroClip, startSeconds: heroStart, endSeconds: heroEnd, timestampSeconds: heroTime, speed: cricket ? 0.78 : 0.85, zoom: 1.03, zoomDirection: "in", reason: heroReason });
-    if (hero) {
-      sequence = sequence.filter(item => !(item.clip === heroClip && heroTime >= Number(item.startSeconds) - 0.35 && heroTime <= Number(item.endSeconds) + 0.35));
-      const desiredIndex = Math.min(sequence.length, Math.max(2, Math.round(sequence.length * 0.68)));
-      sequence = [...sequence.slice(0, desiredIndex), hero, ...sequence.slice(desiredIndex)];
-
-      // For a decisive cricket event, a short replay makes the edit feel like a
-      // highlight rather than a straight clip montage. Only add it when the model
-      // has explicitly identified the event as a wicket/catch/boundary/result.
-      if (cricket && eventLooksLikeHero(heroReason) && sequence.length < 8) {
-        const replayStart = Math.max(0, heroTime - 0.55);
-        const replayEnd = Math.min(durations.get(heroClip) || heroTime + 0.8, heroTime + 0.8);
-        const replay = makeItem({
-          clip: heroClip, startSeconds: replayStart, endSeconds: replayEnd, timestampSeconds: heroTime,
-          speed: 0.72, zoom: 1.06, zoomDirection: "in", reason: "Replay the decisive hero event from a tighter framing."
-        });
-        if (replay) {
-          const heroIndex = sequence.indexOf(hero);
-          sequence = [...sequence.slice(0, heroIndex + 1), replay, ...sequence.slice(heroIndex + 1)];
-        }
-      }
+  // The hero is the story climax, not an accidental final shot. Force it into the middle/end of the narrative when the model supplied one.
+  if (hero) {
+    const d = durationFor(hero.clip, frames);
+    const hs = clamp(hero.timestampSeconds - 0.85, 0, Math.max(0, d - 1.45));
+    const he = clamp(hero.timestampSeconds + 0.85, hs + 0.8, d);
+    const heroIndex = sequence.findIndex(x => x.clip === hero.clip && hero.timestampSeconds >= x.startSeconds - 0.35 && hero.timestampSeconds <= x.endSeconds + 0.35);
+    const heroSegment = { clip: hero.clip, startSeconds: hs, endSeconds: he, timestampSeconds: hero.timestampSeconds, reason: hero.reason, speed: category.toLowerCase() === "cricket" ? 0.72 : 0.86, zoom: 0.98, zoomDirection: "out" as const, isHero: true };
+    if (heroIndex >= 0) {
+      sequence[heroIndex] = { ...sequence[heroIndex], ...heroSegment, isHero: true };
+      const desired = Math.min(Math.max(1, Math.floor(sequence.length * 0.62)), sequence.length - 1);
+      if (heroIndex !== desired) { const [picked] = sequence.splice(heroIndex, 1); sequence.splice(desired, 0, picked); }
+    } else {
+      const desired = Math.min(Math.max(1, Math.floor(sequence.length * 0.62)), sequence.length);
+      sequence.splice(desired, 0, heroSegment);
     }
   }
 
-  // Keep the edit purposeful. Extremely long model-selected shots are a common
-  // source of the "clips joined together" look, so cap normal segments while
-  // allowing the hero package to breathe.
-  sequence = sequence.map((item, index) => {
-    const duration = Number(item.endSeconds) - Number(item.startSeconds);
-    const maxDuration = item === sequence.find(candidate => candidate.clip === heroClip && Number.isFinite(heroTime) && heroTime >= Number(candidate.startSeconds) && heroTime <= Number(candidate.endSeconds)) ? 2.9 : 2.25;
-    if (duration <= maxDuration) return item;
-    return { ...item, endSeconds: Number((Number(item.startSeconds) + maxDuration).toFixed(2)) };
-  });
+  // Avoid a bloated first cut: purposeful story beats, not every upload.
+  const compact = sequence.slice(0, 9);
+  const target = clamp(Number(raw.targetDurationSeconds || 16), 8, 24);
+  const total = compact.reduce((s, x) => s + (x.endSeconds - x.startSeconds) / x.speed, 0);
+  if (total > 25) compact.splice(Math.floor(compact.length / 2), Math.max(0, compact.length - 7));
 
-  const total = sequence.reduce((sum, item) => sum + ((Number(item.endSeconds) - Number(item.startSeconds)) / Math.max(0.65, Number(item.speed) || 1)), 0);
-  const bestMoments = (raw.bestMoments || []).slice(0, 8).map(item => ({ ...item, clip: resolveClipName(item.clip, knownClips) || item.clip })).filter(item => knownClips.includes(item.clip || "")) as RawPlan["bestMoments"];
+  const rawTexts = raw.textOverlays || [];
+  const textOverlays = rawTexts.map(t => {
+    const start = clamp(Number(t.startSeconds ?? 0), 0, target - 0.2);
+    const end = clamp(Number(t.endSeconds ?? start + 1.2), start + 0.35, target);
+    const kind = ["hook", "editorial", "caption", "ending"].includes(t.kind || "") ? t.kind as NormalisedPlan["textOverlays"][number]["kind"] : "editorial";
+    const style = ["clean", "bold", "cinematic", "funny", "sports"].includes(t.style || "") ? t.style as NormalisedPlan["textOverlays"][number]["style"] : category.toLowerCase() === "cricket" ? "sports" : "bold";
+    const position = ["top", "center", "bottom"].includes(t.position || "") ? t.position as NormalisedPlan["textOverlays"][number]["position"] : "center";
+    const animation = ["pop", "fade", "slide", "none"].includes(t.animation || "") ? t.animation as NormalisedPlan["textOverlays"][number]["animation"] : "pop";
+    return { text: String(t.text || "").trim().slice(0, 70), startSeconds: start, endSeconds: end, kind, position, style, animation };
+  }).filter(t => t.text.length > 0).slice(0, 7);
+
+  const musicMood = ["none", "hype", "cinematic", "chill", "funny", "emotional"].includes(raw.musicMood || "") ? raw.musicMood as NormalisedPlan["musicMood"] : "none";
+  const sfx = (raw.sfx || []).map(s => ({ timeSeconds: clamp(Number(s.timeSeconds || 0), 0, target), type: ["impact", "whoosh", "pop", "record-scratch", "crowd", "ding"].includes(s.type) ? s.type as NormalisedPlan["sfx"][number]["type"] : "impact", durationSeconds: clamp(Number(s.durationSeconds || 0.18), 0.08, 0.7), intensity: clamp(Number(s.intensity ?? 0.65), 0.1, 1) })).slice(0, 8);
+
   return {
-    visualSummary: raw.visualSummary || "AI-selected first-cut Reel based on the supplied footage.",
-    heroMoment: heroClip && Number.isFinite(heroTime) ? { clip: heroClip, timestampSeconds: Number(heroTime.toFixed(2)), reason: heroReason } : undefined,
-    bestMoments,
-    targetDurationSeconds: Math.max(6, Math.min(24, Math.round(total || Number(raw.targetDurationSeconds) || 14))),
-    aspectRatio: "9:16",
-    hook: body.hookEnabled && (body.hookText || "").trim().split(/\s+/).length >= 4 ? (body.hookText || "").trim().slice(0, 90) : "",
-    clipSequence: sequence.slice(0, 8),
-    captions: [], captionIdeas: [], transitions: raw.transitions || [],
-    transitionDirection: "Use clean hard/match cuts; let the cricket action provide the energy.",
-    audioDirection: "Keep original source audio. No added music. Preserve continuity across clips.",
-    colorDirection: raw.colorDirection || "Clean, natural and consistent across all source clips.",
-    ending: raw.ending || "End on the strongest meaningful reaction or replay; never an accidental tail or phone UI.",
+    visualSummary: raw.visualSummary || "AI-selected story edit",
+    heroMoment: hero,
+    bestMoments: (raw.bestMoments || []).slice(0, 10).map(m => ({ ...m, clip: resolveClip(m.clip, frames), timestampSeconds: clamp(Number(m.timestampSeconds || 0), 0, durationFor(resolveClip(m.clip, frames), frames)) })),
+    targetDurationSeconds: target, aspectRatio: "9:16", hook: hookEnabled ? String(raw.hook || "") : "", hookEnabled,
+    clipSequence: compact, textOverlays: textOverlays.filter(t => hookEnabled || t.kind !== "hook"), captions: raw.captions || [], transitions: raw.transitions || [],
+    audioDirection: raw.audioDirection || "Keep natural source audio prominent.", musicMood, musicIntensity: clamp(Number(raw.musicIntensity ?? 0.25), 0, 0.45), sfx,
+    colorDirection: raw.colorDirection || "Natural exposure and balanced contrast.", colorPreset: ["natural", "crisp", "warm", "cinematic", "punchy"].includes(raw.colorPreset || "") ? raw.colorPreset as NormalisedPlan["colorPreset"] : "natural",
+    ending: raw.ending || "End on the payoff and remove accidental tail.", coverText: String(raw.coverText || "").slice(0, 45), socialCaption: String(raw.socialCaption || "").slice(0, 220), hashtags: Array.isArray(raw.hashtags) ? raw.hashtags.slice(0, 8).map(String) : []
   };
 }
 
-function isPlaceholderKey(key: string | undefined) { if (!key) return true; const value = key.trim().toLowerCase(); return value === "your_api_key_here" || value.includes("your_api_key") || value.includes("replace_with"); }
-function transient(status: number) { return [429, 500, 502, 503, 504].includes(status); }
-function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-const prompt = (body: AnalyzeRequest, frameText: string) => `You are EDITIO's senior short-form video editor AND sports highlight editor. You are creating a REAL Reel from supplied timestamped video frames. First understand what actually happens over time. Then design an edit that feels intentionally cut by a professional editor, not a montage of attractive frames.
-
-CREATOR UI INPUT
-Edit type: ${body.editType}
-Format: ${body.format}
-Vibe: ${body.vibe}
-Category: ${body.category}
-Creator editing direction: ${body.creativeDirection}
-Hook enabled: ${body.hookEnabled ? "YES" : "NO"}
-Creator hook: ${body.hookEnabled ? `"${body.hookText || ""}"` : "NO HOOK"}
-Reference context: ${body.reference || "None"}
-
-The UI choices are real constraints, but the creator does NOT need to identify the main moment. You must discover the main event yourself. A reference URL is only text/context here; do not claim you watched it.
-
-FOOTAGE MAP
-${frameText}
-
-========================================
-EVENT DETECTION — DO THIS BEFORE EDITING
-========================================
-1. Inspect the entire timestamped frame sequence before choosing any cut.
-2. Identify the single most important REAL EVENT / PAYOFF in the footage and return it as heroMoment.
-3. Think temporally: compare nearby frames around the event. Do not select a single pretty frame as the hero.
-4. Distinguish SETUP, BUILD-UP, ACTION, RESULT/EVENT and REACTION.
-5. The RESULT/EVENT is more important than the reaction. If the actual event is visible, it MUST be shown.
-6. If the event occurs near the end, that is NOT a reason to omit it. Build the Reel toward it.
-7. If a result graphic appears, use it as supporting evidence only. Never substitute a WICKET graphic for an actual visible wicket/catch when the play is available.
-8. heroMoment timestamp must be the closest timestamp to the actual event, not the celebration afterward.
-
-========================================
-CRICKET HIGHLIGHT BRAIN — ABSOLUTE PRIORITY
-========================================
-For cricket, rank moments roughly like this:
-ACTUAL WICKET/DISMISSAL/CATCH/BOUNDARY/BIG HIT/DECISIVE RESULT > BALL CONTACT/ACTION > IMMEDIATE REACTION > CELEBRATION > SETUP.
-
-If a catch/wicket is the story, the edit MUST show:
-1. enough run-up/setup to understand the play,
-2. delivery/action,
-3. the actual catch/wicket/result moment,
-4. a short reaction/celebration if available,
-5. optionally a replay of the decisive event if the same event can be replayed from the footage.
-
-Never make a Reel whose only evidence of a wicket is a later WICKET graphic or celebration when the actual play is visible.
-Never spend several seconds on a bowler standing/walking while cutting the actual wicket to a tiny ending shot.
-If the decisive catch/wicket is at 17s, it is completely acceptable for the Reel to build for 12–15s and pay off at 17s. Do NOT shorten the story by deleting the late payoff.
-
-========================================
-PRO EDITING STYLE — USE THE REFERENCE PRINCIPLES
-========================================
-Do NOT simply join source clips from beginning to end.
-Create a highlight sequence with varied shot lengths and intentional micro-cuts.
-Typical structure when supported:
-HOOK/tease → setup → build-up → delivery/action → HERO EVENT → reaction → replay/alternate view → clean ending.
-
-The hero should normally land in the final third of the Reel. Do not put the payoff in the first few seconds unless the footage genuinely demands it.
-Use 5–8 purposeful segments. A segment should exist because it contributes to the story.
-Normal shots should usually be 0.5–2.2 seconds. Give the hero event enough time to be understood.
-Use exact startSeconds/endSeconds around meaningful action, not arbitrary chunks.
-Do not give every clip equal time.
-Remove dead air, empty scenery, repeated generic shots, sky-only shots, vehicles, screen recordings, phone/control UI and accidental tails unless they are clearly intentional parts of the source edit.
-Use hard cuts or action-matched cuts. Avoid flashy transitions.
-
-========================================
-HERO EVENT PACKAGE
-========================================
-The hero is not just one frame. Build a small package around it.
-For a cricket wicket/catch/boundary:
-- include approximately 0.8–1.5 seconds before the decisive action when available,
-- include the decisive action itself,
-- include approximately 0.5–1.2 seconds after it when useful,
-- optionally replay the decisive action with a tighter crop/slow motion if source footage permits.
-Do not make the replay replace the original event; original event first, replay second.
-
-========================================
-FRAMING / ZOOM
-========================================
-Composition must help the viewer understand the action.
-For cricket, preserve bowler + batsman + pitch/wicket/action area whenever source framing allows it.
-Do NOT aggressively zoom into one player if it makes the actual play impossible to understand.
-Use subtle zoom-in (roughly 1.03–1.08x) for emphasis after context is established.
-Use zoomDirection "out" when the source shot is too tight and a wider readable composition is needed.
-If zoom-out cannot reveal source pixels, prefer the original wider source framing rather than inventing information.
-Never invent a wider view that the source does not contain.
-
-========================================
-SPEED / MOTION
-========================================
-Use speed changes intentionally, not as decoration.
-- setup/low-energy: 1.10–1.30x when useful
-- normal play: 1.0x
-- decisive action/replay: 0.65–0.85x when it improves clarity
-Aim for 1–3 meaningful speed changes across the Reel.
-A wicket/catch replay should often be slower than the live action.
-
-========================================
-DURATION
-========================================
-When enough meaningful footage exists, target roughly 15–20 seconds.
-A strong 17–19 second cricket highlight is better than a weak 10-second montage that misses the payoff.
-Do not pad with irrelevant footage just to reach a duration.
-
-========================================
-HOOK
-========================================
-If hook is disabled, return empty string.
-If enabled but the creator text is weak/short, return empty string. Do not invent a generic hook.
-A visual cold-open is allowed only when it helps the story and does not hide the actual payoff.
-
-========================================
-ACCURACY
-========================================
-Never invent a player, score, wicket, shot type, dialogue, result or action.
-Every clip name must exactly match FOOTAGE MAP.
-Every timestamp must be inside its source duration.
-Sequence order is your editorial decision, not upload order.
-
-RETURN JSON ONLY
-{
-  "visualSummary":"what the footage actually supports",
-  "heroMoment":{"clip":"EXACT filename","timestampSeconds":number,"reason":"specific actual event, e.g. caught at the ball/result moment"},
-  "bestMoments":[{"clip":"EXACT filename","timestampSeconds":number,"reason":"specific useful moment"}],
-  "targetDurationSeconds":number,
-  "aspectRatio":"9:16",
-  "hook":"creator hook or empty string",
-  "clipSequence":[{"clip":"EXACT filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"speed":number,"zoom":number,"zoomDirection":"in|out|none","reason":"specific editorial purpose"}],
-  "captions":[],"captionIdeas":[],
-  "transitions":[{"afterClip":"EXACT filename","type":"hard cut|match cut|quick cut"}],
-  "transitionDirection":"string",
-  "audioDirection":"Keep source audio only",
-  "colorDirection":"string",
-  "ending":"specific reason the ending works"
-}`;
-
-function geminiPart(dataUrl: string) {
-  const match = dataUrl.match(/^data:([^;,]+)(?:;[^,]*)?,(.*)$/s);
-  return match ? { inline_data: { mime_type: match[1], data: match[2] } } : null;
-}
-async function gemini(body: AnalyzeRequest, key: string, model: string) {
-  const frames = selectVisionFrames(body.frames, 18);
-  const frameText = frames.map((f, i) => `Frame ${i + 1}: clip=${f.clipName}, time=${f.timestampSeconds}s, duration=${f.durationSeconds}s`).join("\n");
-  const parts: Array<Record<string, unknown>> = [{ text: prompt(body, frameText) }];
-  for (const frame of frames) { const part = geminiPart(frame.imageDataUrl); if (part) parts.push(part); }
-  let last = "Gemini analysis failed.";
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.08, responseMimeType: "application/json" } }),
-      });
-      const data = await response.json();
-      if (!response.ok) { last = data?.error?.message || `Gemini failed (HTTP ${response.status}).`; if (attempt < 3 && transient(response.status)) { await sleep(attempt === 1 ? 2500 : 6000); continue; } throw new Error(last); }
-      const text = data?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text || "").join("").trim();
-      if (!text) throw new Error("Gemini returned an empty analysis.");
-      return parseJson(text);
-    } catch (error) {
-      last = error instanceof Error ? error.message : last;
-      if (attempt < 3 && /fetch failed|timeout|timed out/i.test(last)) { await sleep(attempt === 1 ? 2500 : 6000); continue; }
-      throw new Error(last);
-    }
+async function callGemini(apiKey: string, model: string, prompt: string, frames: Frame[]) {
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }];
+  for (const frame of frames.slice(0, 18)) {
+    const match = frame.imageDataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) continue;
+    parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+    parts.push({ text: `FRAME: ${frame.clipName} @ ${frame.timestampSeconds.toFixed(2)}s / duration ${frame.duration.toFixed(2)}s` });
   }
-  throw new Error(last);
-}
-async function openai(body: AnalyzeRequest, key: string, model: string) {
-  const frames = selectVisionFrames(body.frames, 18);
-  const frameText = frames.map((f, i) => `Frame ${i + 1}: clip=${f.clipName}, time=${f.timestampSeconds}s, duration=${f.durationSeconds}s`).join("\n");
-  const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt(body, frameText) }];
-  for (const frame of frames) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ model, temperature: 0.08, response_format: { type: "json_object" }, messages: [{ role: "system", content: "You are EDITIO's precise senior video editor. Return only JSON." }, { role: "user", content }] }),
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.25, responseMimeType: "application/json" } })
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || `OpenAI failed (HTTP ${response.status}).`);
-  const text = data?.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("OpenAI returned an empty analysis.");
-  return parseJson(text);
+  const text = await response.text();
+  if (!response.ok) { const err = new Error(`Gemini request failed (${response.status}).`); (err as Error & { status?: number }).status = response.status; throw err; }
+  const data = JSON.parse(text) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+  return cleanJson(data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n") || "");
+}
+
+async function callOpenAI(apiKey: string, prompt: string, frames: Frame[]) {
+  const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+  for (const frame of frames.slice(0, 18)) content.push({ type: "image_url", image_url: { url: frame.imageDataUrl, detail: "low" } });
+  const response = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.25, response_format: { type: "json_object" }, messages: [{ role: "user", content }] }) });
+  if (!response.ok) throw new Error(`OpenAI request failed (${response.status}).`);
+  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+  return cleanJson(data.choices?.[0]?.message?.content || "");
 }
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json() as AnalyzeRequest;
-    if (!body.orderId || !Array.isArray(body.frames) || !body.frames.length) return NextResponse.json({ error: "AI analysis needs an order and video frames." }, { status: 400 });
-    const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").trim().toLowerCase();
-    const key = provider === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
-    const model = provider === "openai" ? (process.env.OPENAI_MODEL || "gpt-4o-mini") : (process.env.GEMINI_MODEL || "gemini-3.8-flash");
-    if (isPlaceholderKey(key)) return NextResponse.json({ error: `${provider === "openai" ? "OpenAI" : "Gemini"} API key is missing. Add it to .env.local and restart the dev server.` }, { status: 500 });
-    try {
-      const raw = provider === "openai" ? await openai(body, key!, model) : await gemini(body, key!, model);
-      const plan = normalisePlan(raw, body);
-      if (!plan.clipSequence?.length) return NextResponse.json({ error: "AI could not find any usable video moments. Please use the single retry." }, { status: 422 });
-      return NextResponse.json({ ok: true, plan, provider, model });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "AI analysis failed.";
-      return NextResponse.json({ error: message }, { status: 502 });
+    const body = await request.json() as { orderId?: string; editType?: string; format?: string; vibe?: string; category?: string; creativeDirection?: string; hookEnabled?: boolean; hookText?: string; reference?: string; frames?: Frame[] };
+    const frames = Array.isArray(body.frames) ? body.frames.filter(f => f?.imageDataUrl && f?.clipName) : [];
+    if (!frames.length) return NextResponse.json({ error: "No usable video frames were supplied." }, { status: 400 });
+
+    const category = body.category || "Other";
+    const hookEnabled = body.hookEnabled !== false;
+    const frameIndex = frames.map((f, i) => `${i + 1}. ${f.clipName} @ ${f.timestampSeconds.toFixed(2)}s / ${f.duration.toFixed(2)}s`).join("\n");
+    const prompt = `You are EDITIO, an expert short-form video editor. You are given sampled frames from every uploaded video. Your job is to produce the COMPLETE edit plan for a ready-to-post vertical Reel.
+
+INPUT
+Category: ${category}
+Vibe: ${body.vibe || "Fast & punchy"}
+Format: ${body.format || "Instagram Reel"}
+Creator direction: ${body.creativeDirection || "Use your best editorial judgement."}
+Hook requested: ${hookEnabled ? "YES — create one only if it improves the opening" : "NO"}
+Creator hook text override: ${body.hookText || "none"}
+Reference style note/URL: ${body.reference || "none"}
+Available frames:\n${frameIndex}
+
+EDITORIAL HIERARCHY — follow this before anything else
+1. REAL HERO EVENT / PAYOFF
+2. ACTION that leads directly into it
+3. REACTION / aftermath
+4. SETUP / context
+5. Everything else is optional and should be removed.
+Never choose a pretty but irrelevant shot over the actual payoff. Never end a reel with the hero just because it occurs late in the source. If the hero occurs late, reach it efficiently and make it the climax, then use reaction/ending if useful.
+
+CRICKET SPECIAL RULE
+If the footage contains an actual wicket/dismissal/catch/boundary/decisive result, that real play is the HERO. A celebration alone is NOT the hero. Build delivery/setup → actual wicket/action → reaction/replay when supported. Keep bowler + batsman + pitch/wicket/ball context visible whenever the source allows. Prefer a slightly wider/zoom-out framing over a dramatic crop that hides the action. If another angle of the same event exists, use it as a replay rather than unrelated filler.
+
+GENERAL EDITING BRAIN
+- Inspect all frames and reason from what is visibly supported; never invent events, dialogue, people, scores, products or results.
+- AI decides exact clip order; do not simply follow upload order.
+- Remove dead time, shaky starts, camera searches, duplicate moments, empty frames, phone UI and accidental tails.
+- Aim for 8–24 seconds, usually 12–18 seconds when enough useful footage exists.
+- Use 5–8 purposeful segments. Individual cuts should feel intentional, not random.
+- Use speed 0.65–0.85 around the hero/impact when it improves readability; 1.10–1.30 only for low-energy setup/dead time.
+- Use zoom 1.00 or below when context matters; zoom-in only when it does not hide important subjects. For action, bowler + batsman + pitch/wicket context is more important than a dramatic crop.
+- Replay a major moment when useful: repeat the same real event briefly, ideally with a different source angle or a tighter crop, but do not make the reel repetitive.
+- Transitions should be mostly hard/action-matched cuts. Use flashy transitions only when genuinely appropriate.
+- Natural source audio should remain the primary reality layer. If useful, request subtle synthetic SFX cues and a very low-volume background music mood; never let them overpower speech or real action.
+- Text is editorial design, not filler. Use it only when it adds context, hook, punchline, or emphasis. Keep it short, elegant, readable, and away from faces, scoreboard and the main action. Never caption every shot just because captions are possible.
+- Generate a hook only when it improves retention. Examples of style, not mandatory wording: “WAIT FOR IT…”, “THIS CHANGED EVERYTHING.”, “WHAT A DELIVERY.”
+- For spoken content, use captions only when useful; for cricket/action, prefer sparse editorial text over subtitle spam.
+- Decide a tasteful color treatment: natural, crisp, warm, cinematic or punchy. Preserve broadcast/source detail.
+- Ending must land on the payoff, reaction, or strongest final frame — never an accidental sky/pavilion/empty tail.
+
+AUDIO/SFX
+You may choose musicMood: none/hype/cinematic/chill/funny/emotional. This prototype will synthesize a subtle royalty-free-style audio bed, so specify mood rather than a copyrighted song. Add SFX only at meaningful beats (impact, whoosh, pop, record-scratch, crowd, ding). Keep the list sparse.
+
+TEXT STYLES
+Use styles clean/bold/cinematic/funny/sports. Position top/center/bottom. Animation pop/fade/slide/none. Do not put important text over the scoreboard or key action. Hook is normally 0–2.5s. Editorial text should land exactly on the moment it refers to.
+
+RETURN JSON ONLY with this exact shape:
+{
+  "visualSummary":"...",
+  "heroMoment":{"clip":"exact filename","timestampSeconds":12.3,"reason":"..."},
+  "bestMoments":[{"clip":"exact filename","timestampSeconds":1.2,"reason":"..."}],
+  "targetDurationSeconds":16,
+  "aspectRatio":"9:16",
+  "hook":"short hook or empty string",
+  "hookEnabled":true,
+  "clipSequence":[{"clip":"exact filename","startSeconds":1.0,"endSeconds":2.4,"reason":"...","speed":1,"zoom":1,"zoomDirection":"none","isHero":false}],
+  "textOverlays":[{"text":"WAIT FOR IT…","startSeconds":0.2,"endSeconds":1.8,"kind":"hook","position":"top","style":"bold","animation":"pop"}],
+  "captions":[],
+  "transitions":[{"afterClip":"exact filename","type":"hard-cut"}],
+  "audioDirection":"...",
+  "musicMood":"hype",
+  "musicIntensity":0.2,
+  "sfx":[{"timeSeconds":6.2,"type":"impact","durationSeconds":0.2,"intensity":0.7}],
+  "colorDirection":"...",
+  "colorPreset":"crisp",
+  "ending":"...",
+  "coverText":"short cover text or empty",
+  "socialCaption":"short copy-ready caption",
+  "hashtags":["#...","#..."]
+}
+
+CRITICAL: heroMoment must identify the actual main event if one exists, and clipSequence MUST contain that moment. Do not hide the hero at the end. Use exact filenames from the supplied frames.`;
+
+    const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").toLowerCase();
+    let raw: RawPlan;
+    let providerUsed = provider;
+    if (provider === "openai") {
+      if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured.");
+      raw = await callOpenAI(process.env.OPENAI_API_KEY, prompt, frames);
+    } else {
+      if (!process.env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured.");
+      let last: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { raw = await callGemini(process.env.GEMINI_API_KEY, DEFAULT_MODEL, prompt, frames); break; }
+        catch (e) { last = e; const status = (e as { status?: number })?.status; if (!status || !transientStatuses.has(status) || attempt === 2) throw e; await new Promise(r => setTimeout(r, 700 * (attempt + 1))); }
+      }
+      if (!raw!) throw last instanceof Error ? last : new Error("AI planner failed.");
     }
+
+    const plan = normalisePlan(raw!, frames, category, hookEnabled);
+    return NextResponse.json({ ok: true, provider: providerUsed, plan });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid AI analysis request." }, { status: 500 });
+    const message = error instanceof Error ? error.message : "AI footage analysis failed.";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
