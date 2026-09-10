@@ -1,112 +1,234 @@
 import { NextResponse } from "next/server";
-import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import ffmpegStatic from "ffmpeg-static";
 
 export const runtime = "nodejs";
 
-type RenderClip = { originalName: string; url: string };
-type SequenceItem = { clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number; speed?: number; zoom?: number; zoomDirection?: "in" | "out" | "none" };
-type Caption = { text?: string; placement?: string; startSeconds?: number; endSeconds?: number };
-type RenderPlan = { aspectRatio?: string; clipSequence?: SequenceItem[]; hook?: string; captions?: Caption[]; captionIdeas?: string[] };
-type RenderRequest = { orderId?: string; clips?: RenderClip[]; plan?: RenderPlan; outputType?: "draft" | "final" };
+const execFileAsync = promisify(execFile);
+const ffmpeg = ffmpegStatic || "ffmpeg";
 
-async function resolveFfmpeg() {
-  const candidates = [path.join(process.cwd(), "node_modules", "ffmpeg-static", process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg"), path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg.exe"), path.join(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg")];
-  for (const candidate of candidates) { try { await stat(candidate); return candidate; } catch { /* try next */ } }
-  return process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+type ClipInput = { originalName: string; url: string; path?: string };
+type TextOverlay = { text: string; startSeconds: number; endSeconds: number; kind?: string; position?: string; style?: string; animation?: string };
+type Sfx = { timeSeconds: number; type: string; durationSeconds?: number; intensity?: number };
+type Segment = { clip: string; startSeconds: number; endSeconds: number; speed?: number; zoom?: number; zoomDirection?: string; isHero?: boolean; reason?: string };
+type Plan = {
+  targetDurationSeconds?: number;
+  aspectRatio?: string;
+  hook?: string;
+  hookEnabled?: boolean;
+  clipSequence?: Segment[];
+  textOverlays?: TextOverlay[];
+  captions?: Array<{ text: string; placement?: string; style?: string; startSeconds?: number; endSeconds?: number }>;
+  audioDirection?: string;
+  musicMood?: string;
+  musicIntensity?: number;
+  sfx?: Sfx[];
+  colorPreset?: string;
+  colorDirection?: string;
+  transitions?: Array<{ afterClip: string; type: string }>;
+};
+
+function safeFilename(value: string) { return path.basename(value); }
+
+function sourcePath(clip: ClipInput) {
+  if (clip.path) return path.join(process.cwd(), safeFilename(path.basename(clip.path)));
+  const url = new URL(clip.url, "http://editio.local");
+  const name = url.searchParams.get("name") || safeFilename(url.pathname);
+  if (!name || name.includes("..")) throw new Error("Invalid uploaded video reference.");
+  return path.join(process.cwd(), "data", "uploads", safeFilename(name));
 }
-function runFfmpeg(args: string[]) {
-  return new Promise<void>(async (resolve, reject) => {
-    const executable = await resolveFfmpeg();
-    const child = spawn(executable, args, { cwd: process.cwd(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("error", error => reject(new Error(`${error.message} | FFmpeg executable: ${executable}`)));
-    child.on("close", code => code === 0 ? resolve() : reject(new Error(`FFmpeg failed (${code}) using ${executable}: ${stderr.slice(-1800)}`)));
-  });
+
+async function hasAudio(file: string) {
+  try {
+    await execFileAsync(ffmpeg, ["-v", "error", "-i", file, "-map", "0:a:0", "-f", "null", "-"]);
+    return true;
+  } catch { return false; }
 }
-function safeName(value: string) { return path.basename(value).replace(/[^a-zA-Z0-9._-]/g, "_"); }
-function filenameFromUrl(url: string) { try { return new URL(`http://editio.local${url}`).searchParams.get("name") || ""; } catch { return ""; } }
-function resolveClip(clips: RenderClip[], requested: string) { if (!requested) return undefined; const exact = clips.find(c => c.originalName === requested); if (exact) return exact; const lower = requested.toLowerCase(); return clips.find(c => c.originalName.toLowerCase() === lower) || clips.find(c => path.basename(c.originalName).toLowerCase() === path.basename(requested).toLowerCase()); }
-function inputArgs(input: string, start?: number, duration?: number) { const args: string[] = []; if (Number.isFinite(start) && (start || 0) > 0) args.push("-ss", String(Math.max(0, start || 0))); args.push("-i", input); if (Number.isFinite(duration) && (duration || 0) > 0) args.push("-t", String(Math.min(30, Math.max(0.25, duration || 0)))); return args; }
-async function findFont() { const candidates = process.platform === "win32" ? ["C:\\Windows\\Fonts\\arialbd.ttf", "C:\\Windows\\Fonts\\arial.ttf"] : ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]; for (const candidate of candidates) { try { await stat(candidate); return candidate; } catch { /* try next */ } } return null; }
-function escapeDrawText(value: string) { return value.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'").replace(/%/g, "\\%").replace(/\n/g, " ").trim().slice(0, 110); }
-function fontForFilter(font: string) { return font.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1\\:"); }
-function overlayFilters(font: string | null, hook?: string, caption?: string) { if (!font || (!hook && !caption)) return ""; const filters: string[] = []; if (hook) filters.push(`drawtext=fontfile='${fontForFilter(font)}':text='${escapeDrawText(hook)}':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=h*0.18:box=1:boxcolor=black@0.55:boxborderw=18`); if (caption) filters.push(`drawtext=fontfile='${fontForFilter(font)}':text='${escapeDrawText(caption)}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=h*0.78:box=1:boxcolor=black@0.45:boxborderw=14`); return filters.join(","); }
-function buildZoomFilter(zoom: number, direction: "in" | "out" | "none") { if (direction === "none" || zoom <= 1.005) return ""; const z = Math.max(1.01, Math.min(1.12, zoom)); if (direction === "in") return `zoompan=z='min(${z.toFixed(2)},zoom+0.0012)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`; return `zoompan=z='max(1.0,${z.toFixed(2)}-on*0.0012)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`; }
-function buildContextFitFilter() {
-  // For zoom-out, do not crop the source first. Fit the complete source inside
-  // the 9:16 canvas over a blurred copy. This can actually reveal bowler,
-  // batsman, wicket and pitch context that a crop-first pipeline would lose.
-  return "split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:8[bg];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2";
-}
-async function renderSegment(input: string, output: string, start?: number, end?: number, hook?: string, caption?: string, finalQuality = false, speed = 1, zoom = 1, zoomDirection: "in" | "out" | "none" = "none") {
-  const duration = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0.25, Math.min(30, (end as number) - (start as number))) : undefined;
-  const safeSpeed = Math.max(0.65, Math.min(1.35, Number.isFinite(speed) ? speed : 1));
-  const font = await findFont();
-  const contextFit = zoomDirection === "out";
-  const baseFilters = contextFit ? buildContextFitFilter() : "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30";
-  const zoomFilter = contextFit ? "" : buildZoomFilter(zoom, zoomDirection);
-  const overlays = overlayFilters(font, hook, caption);
-  const filterParts = [baseFilters, zoomFilter, overlays].filter(Boolean);
-  if (safeSpeed !== 1) filterParts.push(`setpts=PTS/${safeSpeed.toFixed(3)}`);
-  const videoFilter = filterParts.join(",");
-  const audioFilter = safeSpeed !== 1 ? `atempo=${safeSpeed.toFixed(3)}` : undefined;
-  const args = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, ...(audioFilter ? ["-af", audioFilter] : []), "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast", "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", "-movflags", "+faststart", output];
-  try { await runFfmpeg(args); }
-  catch (firstError) {
-    const fallback = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, ...(audioFilter ? ["-af", audioFilter] : []), "-c:v", "mpeg4", "-q:v", finalQuality ? "3" : "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", output];
-    try { await runFfmpeg(fallback); }
-    catch (secondError) { const a = firstError instanceof Error ? firstError.message : "H.264 failed."; const b = secondError instanceof Error ? secondError.message : "MPEG-4 failed."; throw new Error(`${a.slice(-650)} | ${b.slice(-650)}`); }
+
+function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, Number.isFinite(n) ? n : min)); }
+function escText(text: string) { return text.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'").replace(/%/g, "\\%").replace(/\[/g, "\\[").replace(/\]/g, "\\]").replace(/;/g, "\\;"); }
+
+function colorFilter(preset: string) {
+  switch (preset) {
+    case "crisp": return "eq=contrast=1.08:saturation=1.06:brightness=0.01";
+    case "warm": return "eq=contrast=1.04:saturation=1.05:gamma_r=1.03:gamma_b=0.97";
+    case "cinematic": return "eq=contrast=1.06:saturation=0.92:brightness=-0.01";
+    case "punchy": return "eq=contrast=1.12:saturation=1.1:brightness=0.01";
+    default: return "null";
   }
 }
 
+function framingFilter(zoom: number, zoomDirection: string) {
+  const z = clamp(zoom, 0.88, 1.12);
+  if (z > 1.001 || zoomDirection === "in") {
+    const scale = (z * 100).toFixed(1);
+    return `scale=${scale}%:${scale}%:force_original_aspect_ratio=increase,crop=1080:1920:(iw-1080)/2:(ih-1920)/2`;
+  }
+  const fgW = Math.round(1080 * z);
+  const fgH = Math.round(1920 * z);
+  return `split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=22:2[blur];[fg]scale=${fgW}:${fgH}:force_original_aspect_ratio=decrease[fit];[blur][fit]overlay=(W-w)/2:(H-h)/2`;
+}
+
+function transitionFilter(type: string, duration: number) {
+  if (type === "flash" || type === "white-flash") return `fade=t=out:st=${Math.max(0, duration - 0.12).toFixed(3)}:d=0.12:color=white`;
+  if (type === "fade") return `fade=t=out:st=${Math.max(0, duration - 0.18).toFixed(3)}:d=0.18:color=black`;
+  return "null";
+}
+
+function videoFilter(segment: Segment, preset: string, transition: string | undefined, sourceDuration: number) {
+  const speed = clamp(Number(segment.speed ?? 1), 0.65, 1.35);
+  const framing = framingFilter(Number(segment.zoom ?? 1), segment.zoomDirection || "none");
+  const color = colorFilter(preset);
+  const filters: string[] = [];
+  if (framing.includes("split=2")) filters.push(framing); else filters.push(framing);
+  if (color !== "null") filters.push(color);
+  if (transition) {
+    const tf = transitionFilter(transition, sourceDuration / speed);
+    if (tf !== "null") filters.push(tf);
+  }
+  filters.push(`setpts=PTS/${speed.toFixed(3)}`);
+  return filters.join(",");
+}
+
+function fontSpec(style: string) {
+  if (style === "cinematic") return { size: 76, color: "white", border: 2, box: false };
+  if (style === "funny") return { size: 88, color: "white", border: 4, box: true };
+  if (style === "sports") return { size: 94, color: "white", border: 5, box: false };
+  if (style === "clean") return { size: 72, color: "white", border: 3, box: true };
+  return { size: 92, color: "white", border: 5, box: false };
+}
+
+function textFilter(texts: TextOverlay[], totalDuration: number) {
+  let current = "[0:v]";
+  const filters: string[] = [];
+  texts.slice(0, 8).forEach((item, index) => {
+    const text = escText(item.text.trim().slice(0, 70));
+    if (!text) return;
+    const start = clamp(Number(item.startSeconds || 0), 0, Math.max(0, totalDuration - 0.05));
+    const end = clamp(Number(item.endSeconds || start + 1), start + 0.2, totalDuration);
+    const spec = fontSpec(item.style || "bold");
+    const y = item.position === "top" ? "h*0.13" : item.position === "bottom" ? "h*0.78" : "h*0.45";
+    const x = item.animation === "slide" ? `if(lt(t,${(start + 0.22).toFixed(3)}),w-(w-text_w)/2*(t-${start.toFixed(3)})/0.22,(w-text_w)/2)` : "(w-text_w)/2";
+    const alpha = item.animation === "fade" || item.animation === "pop" ? `if(lt(t,${(start + 0.18).toFixed(3)}),(t-${start.toFixed(3)})/0.18,1)` : "1";
+    const box = spec.box ? ":box=1:boxcolor=black@0.32:boxborderw=14" : "";
+    const out = `[txt${index}]`;
+    filters.push(`${current}drawtext=font='DejaVu Sans':text='${text}':fontcolor=${spec.color}@${alpha}:fontsize=${spec.size}:x=${x}:y=${y}:borderw=${spec.border}:bordercolor=black@0.72:enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'${box}${out}`);
+    current = out;
+  });
+  if (!filters.length) return { graph: "[0:v]copy[vout]", map: "[vout]" };
+  return { graph: `${filters.join(";")};${current}copy[vout]`, map: "[vout]" };
+}
+
+function musicExpression(mood: string) {
+  switch (mood) {
+    case "hype": return "0.55*sin(2*PI*110*t)+0.22*sin(2*PI*220*t)+0.08*sin(2*PI*440*t)";
+    case "cinematic": return "0.55*sin(2*PI*65*t)+0.18*sin(2*PI*130*t)+0.05*sin(2*PI*260*t)";
+    case "chill": return "0.45*sin(2*PI*174*t)+0.16*sin(2*PI*261.63*t)+0.06*sin(2*PI*349.23*t)";
+    case "funny": return "0.25*sin(2*PI*330*t)+0.18*sin(2*PI*495*t)+0.1*sin(2*PI*660*t)";
+    case "emotional": return "0.4*sin(2*PI*196*t)+0.15*sin(2*PI*293.66*t)+0.05*sin(2*PI*392*t)";
+    default: return "0";
+  }
+}
+
+function sfxInput(type: string, duration: number) {
+  const d = duration.toFixed(2);
+  switch (type) {
+    case "whoosh": return `anoisesrc=color=pink:amplitude=0.18:duration=${d},highpass=f=500,lowpass=f=5000,afade=t=in:d=${Math.min(0.12,duration/2).toFixed(2)},afade=t=out:st=${Math.max(0.01,duration-0.14).toFixed(2)}:d=0.14`;
+    case "pop": return `sine=frequency=720:duration=${d},afade=t=out:st=${Math.max(0.01,duration-0.12).toFixed(2)}:d=0.12`;
+    case "ding": return `sine=frequency=880:duration=${d},afade=t=out:st=${Math.max(0.01,duration-0.18).toFixed(2)}:d=0.18`;
+    case "crowd": return `anoisesrc=color=brown:amplitude=0.08:duration=${d},lowpass=f=900,afade=t=in:d=0.06,afade=t=out:st=${Math.max(0.01,duration-0.12).toFixed(2)}:d=0.12`;
+    case "record-scratch": return `anoisesrc=color=white:amplitude=0.28:duration=${d},highpass=f=1000,lowpass=f=7000,afade=t=out:st=${Math.max(0.01,duration-0.08).toFixed(2)}:d=0.08`;
+    default: return `sine=frequency=90:duration=${d},afade=t=out:st=${Math.max(0.01,duration-0.12).toFixed(2)}:d=0.12`;
+  }
+}
+
+async function run(args: string[]) {
+  await execFileAsync(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", ...args], { maxBuffer: 20 * 1024 * 1024 });
+}
+
 export async function POST(request: Request) {
-  const tempDir = path.join(process.cwd(), "data", "render-tmp");
+  const workDir = path.join(process.cwd(), "data", "renders", `.work-${crypto.randomUUID()}`);
   try {
-    const body = await request.json() as RenderRequest;
-    if (!body.orderId || !Array.isArray(body.clips) || !body.clips.length) return NextResponse.json({ error: "Render data is incomplete." }, { status: 400 });
-    const outputType = body.outputType || "draft";
-    const uploadDir = path.join(process.cwd(), "data", "uploads"); const renderDir = path.join(process.cwd(), "data", "renders");
-    await mkdir(renderDir, { recursive: true }); await mkdir(tempDir, { recursive: true });
-    const available = body.clips.map(clip => { const filename = filenameFromUrl(clip.url); const filePath = filename ? path.join(uploadDir, safeName(filename)) : ""; return { clip, filePath }; }).filter(item => item.filePath);
-    const existing = [] as typeof available;
-    for (const item of available) { try { await stat(item.filePath); existing.push(item); } catch { /* skip missing */ } }
-    if (!existing.length) return NextResponse.json({ error: "Uploaded footage could not be located on this server. Re-upload the footage to create a new render." }, { status: 404 });
-    const outputName = `${body.orderId}-${outputType}-${crypto.randomUUID()}.mp4`; const outputPath = path.join(renderDir, outputName); const finalQuality = outputType === "final";
-    const planParts = (body.plan?.clipSequence || []).map(item => {
-      const clip = resolveClip(body.clips!, item.clip); if (!clip) return null; const found = existing.find(x => x.clip === clip); if (!found) return null;
-      const timestamp = Number(item.timestampSeconds); const hasRange = Number.isFinite(item.startSeconds) && Number.isFinite(item.endSeconds) && Number(item.endSeconds) > Number(item.startSeconds);
-      const start = hasRange ? Number(item.startSeconds) : Number.isFinite(timestamp) ? Math.max(0, timestamp - 1.5) : 0; const end = hasRange ? Number(item.endSeconds) : Number.isFinite(timestamp) ? timestamp + 2.5 : 8;
-      const speed = Number.isFinite(Number(item.speed)) ? Math.max(0.65, Math.min(1.35, Number(item.speed))) : 1;
-      const zoom = Number.isFinite(Number(item.zoom)) ? Math.max(1, Math.min(1.12, Number(item.zoom))) : 1;
-      const zoomDirection = item.zoomDirection === "in" || item.zoomDirection === "out" ? item.zoomDirection : "none";
-      return { input: found.filePath, start: Math.max(0, start), end: Math.max(start + 0.25, end), speed, zoom, zoomDirection };
-    }).filter(Boolean) as Array<{ input: string; start: number; end: number; speed: number; zoom: number; zoomDirection: "in" | "out" | "none" }>;
-    if (!planParts.length) return NextResponse.json({ error: "AI did not return any valid video cuts. The original footage was not rendered as a fallback. Please retry the AI edit." }, { status: 422 });
-    const captions = (body.plan?.captions || []).filter(c => c.text).map(c => c.text!.trim()).filter(Boolean);
-    const fallbackCaption = captions.length ? captions[0] : body.plan?.captionIdeas?.[0]; const hook = body.plan?.hook?.trim();
-    const tempFiles: string[] = [];
-    try {
-      for (let i = 0; i < planParts.length; i++) {
-        const temp = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}-${i}.mp4`);
-        await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined), finalQuality, planParts[i].speed, planParts[i].zoom, planParts[i].zoomDirection);
-        tempFiles.push(temp);
+    const body = await request.json() as { orderId?: string; clips?: ClipInput[]; plan?: Plan };
+    const clips = Array.isArray(body.clips) ? body.clips : [];
+    const plan = body.plan || {};
+    const segments = Array.isArray(plan.clipSequence) ? plan.clipSequence : [];
+    if (!clips.length || !segments.length) return NextResponse.json({ error: "AI returned no usable edit segments." }, { status: 422 });
+
+    await mkdir(workDir, { recursive: true });
+    const byName = new Map(clips.map(c => [c.originalName.toLowerCase(), c]));
+    const transitions = new Map((plan.transitions || []).map(t => [t.afterClip.toLowerCase(), t.type]));
+    const segmentFiles: string[] = [];
+    let totalDuration = 0;
+
+    for (let i = 0; i < Math.min(segments.length, 9); i++) {
+      const seg = segments[i];
+      const clip = byName.get(String(seg.clip).toLowerCase()) || clips.find(c => c.originalName.toLowerCase().includes(String(seg.clip).toLowerCase())) || clips[0];
+      if (!clip) continue;
+      const input = sourcePath(clip);
+      try { await readFile(input); } catch { throw new Error(`Uploaded clip not found: ${clip.originalName}`); }
+      const sourceDuration = clamp(Number(seg.endSeconds) - Number(seg.startSeconds), 0.25, 30);
+      const speed = clamp(Number(seg.speed ?? 1), 0.65, 1.35);
+      const outputDuration = sourceDuration / speed;
+      const output = path.join(workDir, `segment-${String(i).padStart(2,"0")}.mp4`);
+      const audio = await hasAudio(input);
+      const vf = videoFilter(seg, plan.colorPreset || "natural", transitions.get(clip.originalName.toLowerCase()), sourceDuration);
+      if (audio) {
+        await run(["-ss", String(Math.max(0, Number(seg.startSeconds) || 0)), "-t", sourceDuration.toFixed(3), "-i", input, "-vf", vf, "-af", `atempo=${speed.toFixed(3)}`, "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", output]);
+      } else {
+        await run(["-ss", String(Math.max(0, Number(seg.startSeconds) || 0)), "-t", sourceDuration.toFixed(3), "-i", input, "-f", "lavfi", "-t", outputDuration.toFixed(3), "-i", "anullsrc=r=48000:cl=stereo", "-vf", vf, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", output]);
       }
-      if (tempFiles.length === 1) await writeFile(outputPath, await readFile(tempFiles[0]));
-      else {
-        const listPath = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}.txt`);
-        await writeFile(listPath, tempFiles.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"));
-        try { await runFfmpeg(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast", "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", "-movflags", "+faststart", outputPath]); }
-        finally { await rm(listPath, { force: true }); }
-      }
-    } catch (error) {
-      for (const file of tempFiles) await rm(file, { force: true }); await rm(outputPath, { force: true });
-      const message = error instanceof Error ? error.message : "AI segment rendering failed."; return NextResponse.json({ error: `AI ${outputType} render failed. ${message}` }, { status: 500 });
+      segmentFiles.push(output);
+      totalDuration += outputDuration;
     }
-    for (const file of tempFiles) await rm(file, { force: true });
-    return NextResponse.json({ ok: true, status: "ready", url: `/api/render/file?name=${encodeURIComponent(outputName)}`, outputName, outputType, usedAiCuts: true, aiCutCount: planParts.length });
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Render failed." }, { status: 500 }); }
+
+    if (!segmentFiles.length) throw new Error("No renderable AI segments were produced.");
+    const concatList = path.join(workDir, "concat.txt");
+    await writeFile(concatList, segmentFiles.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
+    const concatFile = path.join(workDir, "assembled.mp4");
+    await run(["-f", "concat", "-safe", "0", "-i", concatList, "-c", "copy", "-movflags", "+faststart", concatFile]);
+
+    const texts: TextOverlay[] = [...(plan.textOverlays || [])];
+    if (plan.hookEnabled !== false && plan.hook && !texts.some(t => t.kind === "hook")) texts.unshift({ text: plan.hook, startSeconds: 0.25, endSeconds: 2.0, kind: "hook", position: "top", style: "bold", animation: "pop" });
+    for (const caption of plan.captions || []) if (caption.text) texts.push({ text: caption.text, startSeconds: Number(caption.startSeconds ?? 0), endSeconds: Number(caption.endSeconds ?? 1.5), kind: "caption", position: caption.placement?.includes("top") ? "top" : caption.placement?.includes("bottom") ? "bottom" : "center", style: caption.style || "clean", animation: "fade" });
+    const textGraph = textFilter(texts, totalDuration);
+
+    const musicMood = plan.musicMood && plan.musicMood !== "none" ? plan.musicMood : "none";
+    const sfx = (plan.sfx || []).slice(0, 8);
+    const needsAudioMix = musicMood !== "none" || sfx.length > 0;
+    const finalName = `${body.orderId || "editio"}-${Date.now().toString(36)}-preview.mp4`;
+    const finalPath = path.join(process.cwd(), "data", "renders", finalName);
+    await mkdir(path.dirname(finalPath), { recursive: true });
+
+    if (!needsAudioMix) {
+      await run(["-i", concatFile, "-filter_complex", textGraph.graph, "-map", textGraph.map, "-map", "0:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", finalPath]);
+    } else {
+      const args: string[] = ["-i", concatFile];
+      const musicIndex = 1;
+      if (musicMood !== "none") args.push("-f", "lavfi", "-i", `aevalsrc=${musicExpression(musicMood)}:s=48000:d=${Math.max(1,totalDuration).toFixed(3)}`);
+      const sfxStartIndex = musicMood !== "none" ? 2 : 1;
+      sfx.forEach((effect, index) => {
+        const duration = clamp(Number(effect.durationSeconds ?? 0.18), 0.08, 0.7);
+        args.push("-f", "lavfi", "-i", sfxInput(effect.type, duration));
+      });
+      const audioInputs = 1 + (musicMood !== "none" ? 1 : 0) + sfx.length;
+      const audioParts = ["[0:a]volume=1.0[base]"];
+      const mixLabels = ["[base]"];
+      if (musicMood !== "none") { const vol = clamp(Number(plan.musicIntensity ?? 0.18), 0.04, 0.32); audioParts.push(`[1:a]volume=${vol.toFixed(3)}[music]`); mixLabels.push("[music]"); }
+      sfx.forEach((effect, index) => { const inputIndex = sfxStartIndex + index; const delay = Math.round(clamp(Number(effect.timeSeconds || 0), 0, totalDuration) * 1000); const vol = clamp(Number(effect.intensity ?? 0.65), 0.05, 1); audioParts.push(`[${inputIndex}:a]adelay=${delay}:all=1,volume=${vol.toFixed(3)}[sfx${index}]`); mixLabels.push(`[sfx${index}]`); });
+      audioParts.push(`${mixLabels.join("")}amix=inputs=${audioInputs}:duration=first:dropout_transition=0[aout]`);
+      const complex = `${textGraph.graph};${audioParts.join(";")}`;
+      args.push("-filter_complex", complex, "-map", textGraph.map, "-map", "[aout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-r", "30", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", finalPath);
+      await run(args);
+    }
+
+    return NextResponse.json({ ok: true, url: `/api/render/file?name=${encodeURIComponent(finalName)}`, usedAiCuts: true, aiCutCount: segmentFiles.length, features: { smartText: texts.length > 0, music: musicMood !== "none", sfx: sfx.length, slowMotion: segments.some(s => Number(s.speed ?? 1) < 0.9), smartReframe: segments.some(s => Number(s.zoom ?? 1) !== 1 || s.zoomDirection), color: plan.colorPreset || "natural" } });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "AI draft rendering failed.";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }
