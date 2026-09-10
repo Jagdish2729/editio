@@ -48,13 +48,16 @@ export async function extractVideoFrames(clipName: string, url: string): Promise
   const context = canvas.getContext("2d");
   if (!context) return [];
 
-  // Six samples give the vision model enough coverage to distinguish the opening,
-  // action, reaction and ending without sending an unnecessarily huge payload.
+  // The vision model can only receive a limited number of frames, so distribute
+  // them across all uploaded clips. A single clip gets dense coverage (18 frames)
+  // instead of the old 6-frame sampling. This is important for short events such
+  // as a wicket, catch or impact that can happen between coarse samples.
+  const sampleCount = duration < 3 ? 3 : 18;
   const sampleTimes = duration < 3
-    ? [Math.max(0, duration * 0.35)]
-    : [0.08, 0.24, 0.40, 0.58, 0.76, 0.92].map(position => duration * position);
-  const frames: VideoFrame[] = [];
+    ? [0.2, 0.5, 0.8].map(position => duration * position)
+    : Array.from({ length: sampleCount }, (_, index) => duration * (0.04 + (0.92 * index) / (sampleCount - 1)));
 
+  const frames: VideoFrame[] = [];
   for (const rawTime of sampleTimes) {
     const timestampSeconds = Math.min(Math.max(rawTime, 0), Math.max(duration - 0.05, 0));
     await seek(video, timestampSeconds);
