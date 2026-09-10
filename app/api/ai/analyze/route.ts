@@ -73,31 +73,66 @@ function isPlaceholderKey(key: string | undefined) {
   return normalized === "your_api_key_here" || normalized.includes("your_api_key") || normalized.includes("replace_with");
 }
 
+function clipKey(value: string) {
+  return value.trim().toLowerCase().replace(/\\/g, "/").split("/").pop() || "";
+}
+
+function clipStem(value: string) {
+  return clipKey(value).replace(/\.[a-z0-9]{2,5}$/i, "");
+}
+
+function resolveClipName(value: string | undefined, knownClips: string[]) {
+  if (!value) return null;
+  const exact = knownClips.find(name => name === value);
+  if (exact) return exact;
+  const key = clipKey(value);
+  const stem = clipStem(value);
+  const byKey = knownClips.find(name => clipKey(name) === key);
+  if (byKey) return byKey;
+  const byStem = knownClips.find(name => clipStem(name) === stem);
+  if (byStem) return byStem;
+
+  // Gemini sometimes returns a generic alias such as "clip 1". Resolve it only
+  // when the alias is unambiguous; this prevents a valid plan from being discarded.
+  const match = key.match(/^(?:clip|video)[ _-]?(\d+)$/i);
+  if (match) {
+    const index = Number(match[1]) - 1;
+    if (knownClips[index]) return knownClips[index];
+  }
+  if (knownClips.length === 1) return knownClips[0];
+  return null;
+}
+
 function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
   const clipDurations = new Map<string, number>();
   for (const frame of body.frames) clipDurations.set(frame.clipName, Math.max(0, frame.durationSeconds));
-  const knownClips = new Set(clipDurations.keys());
+  const knownClips = Array.from(clipDurations.keys());
 
-  const sequence = (raw.clipSequence || []).filter(item => item.clip && knownClips.has(item.clip)).slice(0, 8).map(item => {
-    const duration = clipDurations.get(item.clip!) || 0;
-    const anchor = Number(item.timestampSeconds);
-    let start = Number(item.startSeconds);
-    let end = Number(item.endSeconds);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-      const safeAnchor = Number.isFinite(anchor) ? anchor : duration * 0.5;
-      start = Math.max(0, safeAnchor - 1.5);
-      end = Math.min(duration || safeAnchor + 2.5, safeAnchor + 2.5);
-    }
-    start = Math.max(0, Math.min(start, Math.max(0, duration - 0.25)));
-    end = Math.max(start + 0.75, Math.min(end, duration || end));
-    return {
-      ...item,
-      startSeconds: Number(start.toFixed(2)),
-      endSeconds: Number(end.toFixed(2)),
-      timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
-      reason: item.reason || "Selected as a strong visual moment."
-    };
-  }).filter(item => Number(item.endSeconds) > Number(item.startSeconds));
+  const sequence = (raw.clipSequence || [])
+    .map(item => ({ ...item, clip: resolveClipName(item.clip, knownClips) || undefined }))
+    .filter(item => item.clip)
+    .slice(0, 8)
+    .map(item => {
+      const duration = clipDurations.get(item.clip!) || 0;
+      const anchor = Number(item.timestampSeconds);
+      let start = Number(item.startSeconds);
+      let end = Number(item.endSeconds);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        const safeAnchor = Number.isFinite(anchor) ? anchor : duration * 0.5;
+        start = Math.max(0, safeAnchor - 1.5);
+        end = Math.min(duration || safeAnchor + 2.5, safeAnchor + 2.5);
+      }
+      start = Math.max(0, Math.min(start, Math.max(0, duration - 0.25)));
+      end = Math.max(start + 0.75, Math.min(end, duration || end));
+      return {
+        ...item,
+        startSeconds: Number(start.toFixed(2)),
+        endSeconds: Number(end.toFixed(2)),
+        timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
+        reason: item.reason || "Selected as a strong visual moment."
+      };
+    })
+    .filter(item => Number(item.endSeconds) > Number(item.startSeconds));
 
   const target = sequence.reduce((sum, item) => sum + Number(item.endSeconds) - Number(item.startSeconds), 0);
   const captions = body.includeCaptions ? (raw.captions || []).filter(item => item.text).slice(0, 5).map(item => ({
@@ -153,27 +188,28 @@ EDITING RULES
 3. Start with the strongest attention-grabbing visual, not automatically the first source clip.
 4. Remove obvious dead space. Vary shot selection and avoid repeating the same moment unless it serves the story.
 5. Use the creator's brief and vibe as the primary creative direction; do not blindly apply generic trends.
-6. Every clipSequence item MUST include startSeconds and endSeconds using the SOURCE clip's timeline. They should surround the chosen visual moment and stay inside that clip's duration.
-7. timestampSeconds is the visual anchor for the selected moment.
-8. The sequence should have a clear opening, build/middle and satisfying ending. Explain why each chosen moment is there.
-9. Do not invent dialogue, actions, people, scores, locations or objects that are not visible in the supplied frames.
-10. No music. Preserve the creator's original audio.
-11. ${hookInstruction}
-12. ${captionInstruction}
-13. Keep captions away from the extreme bottom UI area. Prefer bottom/center with concise text.
-14. If the footage is weak, still make the best honest edit possible rather than fabricating a stronger moment.
+6. Every clipSequence item MUST use the EXACT clip filename from the FOOTAGE MAP. Do not invent, abbreviate, rename, or translate filenames.
+7. Every clipSequence item MUST include startSeconds and endSeconds using the SOURCE clip's timeline. Keep them inside that clip's duration.
+8. timestampSeconds is the visual anchor for the selected moment.
+9. The sequence should have a clear opening, build/middle and satisfying ending. Explain why each chosen moment is there.
+10. Do not invent dialogue, actions, people, scores, locations or objects that are not visible in the supplied frames.
+11. No music. Preserve the creator's original audio.
+12. ${hookInstruction}
+13. ${captionInstruction}
+14. Keep captions away from the extreme bottom UI area. Prefer bottom/center with concise text.
+15. If the footage is weak, still make the best honest edit possible rather than fabricating a stronger moment.
 
 RETURN JSON ONLY:
 {
   "visualSummary":"brief description of what the footage supports",
-  "bestMoments":[{"clip":"filename","timestampSeconds":number,"reason":"why this moment is strong"}],
+  "bestMoments":[{"clip":"EXACT filename from FOOTAGE MAP","timestampSeconds":number,"reason":"why this moment is strong"}],
   "targetDurationSeconds":number,
   "aspectRatio":"9:16",
   "hook":"short string or empty",
-  "clipSequence":[{"clip":"filename","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"editing reason"}],
+  "clipSequence":[{"clip":"EXACT filename from FOOTAGE MAP","startSeconds":number,"endSeconds":number,"timestampSeconds":number,"reason":"editing reason"}],
   "captions":[{"text":"string","placement":"top|center|bottom","style":"bold|clean","startSeconds":number,"endSeconds":number}],
   "captionIdeas":["string"],
-  "transitions":[{"afterClip":"filename","type":"hard cut|match cut|quick cut"}],
+  "transitions":[{"afterClip":"EXACT filename from FOOTAGE MAP","type":"hard cut|match cut|quick cut"}],
   "transitionDirection":"string",
   "audioDirection":"Keep source audio only",
   "colorDirection":"string",
@@ -184,42 +220,61 @@ RETURN JSON ONLY:
 function dataUrlToGeminiPart(dataUrl: string) {
   const match = dataUrl.match(/^data:([^;,]+)(?:;[^,]*)?,(.*)$/s);
   if (!match) return null;
-  return {
-    inline_data: {
-      mime_type: match[1],
-      data: match[2]
-    }
-  };
+  return { inline_data: { mime_type: match[1], data: match[2] } };
+}
+
+function isTransientStatus(status: number) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function analyzeWithGemini(body: AnalyzeRequest, apiKey: string, model: string) {
   const frameList = body.frames.slice(0, 18);
   const frameText = frameList.map((frame, index) => `Frame ${index + 1}: clip=${frame.clipName}, time=${frame.timestampSeconds}s, clipDuration=${frame.durationSeconds}s`).join("\n");
   const parts: Array<Record<string, unknown>> = [{ text: EDITOR_PROMPT(body, frameText) }];
-
   for (const frame of frameList) {
     const imagePart = dataUrlToGeminiPart(frame.imageDataUrl);
     if (imagePart) parts.push(imagePart);
   }
 
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature: 0.15,
-        responseMimeType: "application/json"
+  let lastError = "Gemini analysis failed.";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.15, responseMimeType: "application/json" }
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        lastError = data?.error?.message || `Gemini analysis failed (HTTP ${response.status}).`;
+        if (attempt === 1 && isTransientStatus(response.status)) {
+          await sleep(1200);
+          continue;
+        }
+        throw new Error(lastError);
       }
-    })
-  });
 
-  const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || "Gemini analysis failed.");
-
-  const text = data?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("").trim();
-  if (!text) throw new Error("Gemini returned an empty analysis.");
-  return parseJson(text);
+      const text = data?.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text || "").join("").trim();
+      if (!text) throw new Error("Gemini returned an empty analysis.");
+      return parseJson(text);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : lastError;
+      if (attempt === 1 && /fetch failed|timed out|timeout/i.test(lastError)) {
+        await sleep(1200);
+        continue;
+      }
+      throw new Error(lastError);
+    }
+  }
+  throw new Error(lastError);
 }
 
 async function analyzeWithOpenAI(body: AnalyzeRequest, apiKey: string, model: string) {
@@ -256,8 +311,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing edit brief or video frames." }, { status: 400 });
     }
 
-    // Gemini is the default provider for EDITIO's visual planning. OpenAI remains
-    // available as a provider option so we can compare quality without rewriting the pipeline.
     const provider = (process.env.EDITIO_AI_PROVIDER || "gemini").trim().toLowerCase();
     const useLocalFallback = process.env.EDITIO_AI_FALLBACK !== "false";
     const apiKey = provider === "openai" ? process.env.OPENAI_API_KEY : process.env.GEMINI_API_KEY;
@@ -275,13 +328,18 @@ export async function POST(request: Request) {
 
     const model = provider === "openai"
       ? (process.env.OPENAI_MODEL || "gpt-4o-mini")
-      : (process.env.GEMINI_MODEL || "gemini-2.5-flash");
+      : (process.env.GEMINI_MODEL || "gemini-3.8-flash");
 
     try {
       const rawPlan = provider === "openai"
         ? await analyzeWithOpenAI(body, apiKey!, model)
         : await analyzeWithGemini(body, apiKey!, model);
       const plan = normalisePlan(rawPlan, body);
+
+      if (!plan.clipSequence?.length) {
+        return NextResponse.json({ error: "AI returned a plan, but no usable video cuts could be mapped to the uploaded footage. Please retry the AI edit." }, { status: 422 });
+      }
+
       return NextResponse.json({ ok: true, plan, model, provider, fallback: false });
     } catch (error) {
       if (useLocalFallback) {
