@@ -1,3 +1,5 @@
+import { getUser } from "./session";
+
 export type AIPlan = {
   visualSummary?: string;
   bestMoments?: Array<{ clip: string; timestampSeconds: number; reason: string }>;
@@ -41,14 +43,23 @@ export type EditOrder = {
   finalRenderStatus?: "not_started" | "rendering" | "ready" | "failed";
   finalError?: string;
   createdAt: string;
+  creatorIdentifier?: string;
 };
 
 const ORDERS_KEY = "editio_orders";
 
+function getAccountKey() {
+  return getUser()?.identifier?.trim().toLowerCase() || null;
+}
+
 export function getOrders(): EditOrder[] {
   if (typeof window === "undefined") return [];
+  const accountKey = getAccountKey();
+  if (!accountKey) return [];
+
   try {
-    return JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
+    const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
+    return allOrders.filter(order => order.creatorIdentifier === accountKey);
   } catch {
     return [];
   }
@@ -56,19 +67,41 @@ export function getOrders(): EditOrder[] {
 
 export function createOrder(order: Omit<EditOrder, "id" | "createdAt" | "status">) {
   if (typeof window === "undefined") return null;
+  const accountKey = getAccountKey();
+  if (!accountKey) return null;
+
   const next: EditOrder = {
     ...order,
+    creatorIdentifier: accountKey,
     id: `ED-${Date.now().toString(36).toUpperCase()}`,
     status: "submitted",
     createdAt: new Date().toISOString(),
   };
-  localStorage.setItem(ORDERS_KEY, JSON.stringify([next, ...getOrders()]));
+
+  try {
+    const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
+    localStorage.setItem(ORDERS_KEY, JSON.stringify([next, ...allOrders]));
+  } catch {
+    localStorage.setItem(ORDERS_KEY, JSON.stringify([next]));
+  }
   return next;
 }
 
 export function updateOrder(id: string, patch: Partial<EditOrder>) {
   if (typeof window === "undefined") return null;
-  const next = getOrders().map(order => order.id === id ? { ...order, ...patch } : order);
-  localStorage.setItem(ORDERS_KEY, JSON.stringify(next));
-  return next.find(order => order.id === id) || null;
+  const accountKey = getAccountKey();
+  if (!accountKey) return null;
+
+  try {
+    const allOrders = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]") as EditOrder[];
+    const next = allOrders.map(order =>
+      order.id === id && order.creatorIdentifier === accountKey
+        ? { ...order, ...patch }
+        : order
+    );
+    localStorage.setItem(ORDERS_KEY, JSON.stringify(next));
+    return next.find(order => order.id === id && order.creatorIdentifier === accountKey) || null;
+  } catch {
+    return null;
+  }
 }
