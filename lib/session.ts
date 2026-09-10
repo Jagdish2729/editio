@@ -3,6 +3,7 @@ export type EditioUser = {
   identifier: string;
   passwordHash?: string;
   role: "creator" | "editor";
+  aiFreeCreditUsed?: boolean;
 };
 
 const USER_KEY = "editio_user";
@@ -17,7 +18,7 @@ async function hashPassword(password: string) {
 export async function saveCreatorUser(user: Omit<EditioUser, "role" | "passwordHash">, password: string) {
   if (typeof window === "undefined") return;
   const passwordHash = await hashPassword(password);
-  localStorage.setItem(USER_KEY, JSON.stringify({ ...user, passwordHash, role: "creator" }));
+  localStorage.setItem(USER_KEY, JSON.stringify({ ...user, passwordHash, role: "creator", aiFreeCreditUsed: false }));
 }
 
 export function getUser(): EditioUser | null {
@@ -39,6 +40,18 @@ export function startSession() {
 
 export function hasSession() {
   return typeof window !== "undefined" && localStorage.getItem(SESSION_KEY) === "active";
+}
+
+export function hasFreeAiCredit() {
+  return getUser()?.aiFreeCreditUsed !== true;
+}
+
+export function consumeFreeAiCredit() {
+  if (typeof window === "undefined") return false;
+  const user = getUser();
+  if (!user || user.aiFreeCreditUsed) return false;
+  localStorage.setItem(USER_KEY, JSON.stringify({ ...user, aiFreeCreditUsed: true }));
+  return true;
 }
 
 export function endSession() {
