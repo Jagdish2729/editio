@@ -8,13 +8,11 @@ import { consumeFreeAiCredit, hasFreeAiCredit } from "../../../lib/session";
 import styles from "./edit.module.css";
 
 type Clip = { id: string; file: File; url: string };
-
 const modes = [
   { id: "ai" as const, icon: "✦", title: "AI Edit", note: "Fast + affordable", text: "Let AI find the best moments, pacing and cuts for you." },
   { id: "human" as const, icon: "◒", title: "Human Edit", note: "Personal + creative", text: "A real editor turns your footage into something that feels like you." },
   { id: "both" as const, icon: "⚡", title: "AI + Human", note: "Premium + polished", text: "AI builds the first cut. A human editor gives it the final glow-up." },
 ];
-
 const categoryGuides: Record<string, string> = {
   Cricket: "Create a high-energy cricket Reel. Identify the strongest cricket moment and build a clear setup → action → payoff story. Reject phone UI, screen recordings, black/empty frames, dead time and repetitive shots. Prefer the strongest reaction or action as the hook, then use run-up/build-up, ball release, batsman action/contact, result and meaningful reaction where those moments are actually visible. Keep cuts tight, avoid repeating the same moment, preserve natural source audio, and finish on a satisfying cricket moment. Never invent scores, wickets, shots, players, dialogue or events that are not visible.",
   Fashion: "Create a stylish fashion Reel. Prioritize the strongest outfit reveal, movement, detail shots, transitions between looks and confident final frame. Remove awkward pauses, duplicate angles, empty frames and phone UI. Keep pacing polished and visual, with a strong opening and a clean ending. Do not invent clothing details or actions that are not visible.",
@@ -27,7 +25,6 @@ const categoryGuides: Record<string, string> = {
   Business: "Create a sharp business/creator Reel. Prioritize the strongest talking/action moment, useful visual, product/work shot or clear payoff visible in the footage. Remove pauses, repetition, empty frames and phone UI. Keep the story concise and credible. Never invent claims, results, quotes or facts.",
   Other: "Describe exactly what you want this Reel to feel like and what the editor should prioritize. Mention the story, important moments, pacing, opening, ending, things to remove and any specific creative direction you have in mind."
 };
-
 const categories = Object.keys(categoryGuides);
 type UploadResponse = { ok?: boolean; error?: string; files?: Array<{ originalName: string; url: string }> };
 type AIResponse = { ok?: boolean; error?: string; plan?: unknown };
@@ -71,7 +68,7 @@ export default function CreatorEdit() {
       const uploadResponse = await fetch("/api/uploads", { method: "POST", body: formData }); const uploadData = await uploadResponse.json() as UploadResponse;
       if (!uploadResponse.ok || !uploadData.files?.length) throw new Error(uploadData.error || "Could not upload your footage.");
       const uploaded = uploadData.files.map(file => ({ originalName: file.originalName, url: file.url })); const clipUrls = uploaded.map(file => file.url); const clipNames = uploaded.map(file => file.originalName);
-      const order = createOrder({ mode, modeLabel: selectedMode.title, format, vibe, category, creativeDirection: creativeDirection.trim(), hookEnabled, hookText: hookText.trim(), reference: reference.trim(), clipNames, clipUrls, clipCount: clipUrls.length, aiStatus: mode === "human" ? "not_started" : "queued", renderStatus: mode === "human" ? "not_started" : "rendering" });
+      const order = createOrder({ mode, modeLabel: selectedMode.title, format, vibe, category, creativeDirection: creativeDirection.trim(), hookEnabled, hookText: hookText.trim(), brief: creativeDirection.trim(), includeHook: hookEnabled, reference: reference.trim(), clipNames, clipUrls, clipCount: clipUrls.length, aiStatus: mode === "human" ? "not_started" : "queued", renderStatus: mode === "human" ? "not_started" : "rendering" });
       if (!order) throw new Error("Could not create the edit order.");
       setOrderId(order.id); setUploadedClips(uploaded);
       if (mode !== "human") {
