@@ -7,7 +7,15 @@ import { spawn } from "child_process";
 export const runtime = "nodejs";
 
 type RenderClip = { originalName: string; url: string };
-type SequenceItem = { clip: string; startSeconds?: number; endSeconds?: number; timestampSeconds?: number };
+type SequenceItem = {
+  clip: string;
+  startSeconds?: number;
+  endSeconds?: number;
+  timestampSeconds?: number;
+  speed?: number;
+  zoom?: number;
+  zoomDirection?: "in" | "out" | "none";
+};
 type Caption = { text?: string; placement?: string; startSeconds?: number; endSeconds?: number };
 type RenderPlan = { aspectRatio?: string; clipSequence?: SequenceItem[]; hook?: string; captions?: Caption[]; captionIdeas?: string[] };
 type RenderRequest = { orderId?: string; clips?: RenderClip[]; plan?: RenderPlan; outputType?: "draft" | "final" };
@@ -65,16 +73,43 @@ function overlayFilters(font: string | null, hook?: string, caption?: string) {
   return filters.join(",");
 }
 
-async function renderSegment(input: string, output: string, start?: number, end?: number, hook?: string, caption?: string, finalQuality = false) {
+function buildZoomFilter(zoom: number, direction: "in" | "out" | "none") {
+  if (direction === "none" || zoom <= 1.005) return "";
+  const z = Math.max(1.01, Math.min(1.12, zoom));
+  // zoompan gives us a subtle animated crop rather than a static digital crop.
+  // One output frame is generated per input frame so the source duration remains intact.
+  if (direction === "in") {
+    return `zoompan=z='min(${z.toFixed(2)},zoom+0.0012)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`;
+  }
+  return `zoompan=z='max(1.0,${z.toFixed(2)}-on*0.0012)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`;
+}
+
+async function renderSegment(
+  input: string,
+  output: string,
+  start?: number,
+  end?: number,
+  hook?: string,
+  caption?: string,
+  finalQuality = false,
+  speed = 1,
+  zoom = 1,
+  zoomDirection: "in" | "out" | "none" = "none"
+) {
   const duration = Number.isFinite(start) && Number.isFinite(end) ? Math.max(0.25, Math.min(30, (end as number) - (start as number))) : undefined;
+  const safeSpeed = Math.max(0.65, Math.min(1.35, Number.isFinite(speed) ? speed : 1));
   const font = await findFont();
   const baseFilters = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30";
+  const zoomFilter = buildZoomFilter(zoom, zoomDirection);
   const overlays = overlayFilters(font, hook, caption);
-  const videoFilter = overlays ? `${baseFilters},${overlays}` : baseFilters;
-  const args = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast", "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", "-movflags", "+faststart", output];
+  const filterParts = [baseFilters, zoomFilter, overlays].filter(Boolean);
+  if (safeSpeed !== 1) filterParts.push(`setpts=PTS/${safeSpeed.toFixed(3)}`);
+  const videoFilter = filterParts.join(",");
+  const audioFilter = safeSpeed !== 1 ? `atempo=${safeSpeed.toFixed(3)}` : undefined;
+  const args = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, ...(audioFilter ? ["-af", audioFilter] : []), "-c:v", "libx264", "-preset", finalQuality ? "medium" : "veryfast", "-crf", finalQuality ? "20" : "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", "-movflags", "+faststart", output];
   try { await runFfmpeg(args); }
   catch (firstError) {
-    const fallback = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, "-c:v", "mpeg4", "-q:v", finalQuality ? "3" : "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", output];
+    const fallback = ["-y", ...inputArgs(input, start, duration), "-vf", videoFilter, ...(audioFilter ? ["-af", audioFilter] : []), "-c:v", "mpeg4", "-q:v", finalQuality ? "3" : "5", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", finalQuality ? "192k" : "128k", "-ar", "48000", output];
     try { await runFfmpeg(fallback); }
     catch (secondError) {
       const a = firstError instanceof Error ? firstError.message : "H.264 failed."; const b = secondError instanceof Error ? secondError.message : "MPEG-4 failed.";
@@ -101,8 +136,11 @@ export async function POST(request: Request) {
       const clip = resolveClip(body.clips!, item.clip); if (!clip) return null; const found = existing.find(x => x.clip === clip); if (!found) return null;
       const timestamp = Number(item.timestampSeconds); const hasRange = Number.isFinite(item.startSeconds) && Number.isFinite(item.endSeconds) && Number(item.endSeconds) > Number(item.startSeconds);
       const start = hasRange ? Number(item.startSeconds) : Number.isFinite(timestamp) ? Math.max(0, timestamp - 1.5) : 0; const end = hasRange ? Number(item.endSeconds) : Number.isFinite(timestamp) ? timestamp + 2.5 : 8;
-      return { input: found.filePath, start: Math.max(0, start), end: Math.max(start + 0.25, end) };
-    }).filter(Boolean) as Array<{ input: string; start: number; end: number }>;
+      const speed = Number.isFinite(Number(item.speed)) ? Math.max(0.65, Math.min(1.35, Number(item.speed))) : 1;
+      const zoom = Number.isFinite(Number(item.zoom)) ? Math.max(1, Math.min(1.12, Number(item.zoom))) : 1;
+      const zoomDirection = item.zoomDirection === "in" || item.zoomDirection === "out" ? item.zoomDirection : "none";
+      return { input: found.filePath, start: Math.max(0, start), end: Math.max(start + 0.25, end), speed, zoom, zoomDirection };
+    }).filter(Boolean) as Array<{ input: string; start: number; end: number; speed: number; zoom: number; zoomDirection: "in" | "out" | "none" }>;
 
     // Never silently render the original footage. A successful AI render must contain
     // at least one valid segment from the AI plan.
@@ -117,15 +155,24 @@ export async function POST(request: Request) {
     try {
       for (let i = 0; i < planParts.length; i++) {
         const temp = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}-${i}.mp4`);
-        await renderSegment(planParts[i].input, temp, planParts[i].start, planParts[i].end, i === 0 ? hook : undefined, captions[i] || (i === 0 ? fallbackCaption : undefined), finalQuality);
+        await renderSegment(
+          planParts[i].input,
+          temp,
+          planParts[i].start,
+          planParts[i].end,
+          i === 0 ? hook : undefined,
+          captions[i] || (i === 0 ? fallbackCaption : undefined),
+          finalQuality,
+          planParts[i].speed,
+          planParts[i].zoom,
+          planParts[i].zoomDirection
+        );
         tempFiles.push(temp);
       }
 
       if (tempFiles.length === 1) {
         await writeFile(outputPath, await readFile(tempFiles[0]));
       } else {
-        // Re-encode during concatenation so segments with different timestamps/codecs
-        // cannot fail silently and leave us tempted to fall back to the source footage.
         const listPath = path.join(tempDir, `${body.orderId}-${crypto.randomUUID()}.txt`);
         await writeFile(listPath, tempFiles.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"));
         try {
