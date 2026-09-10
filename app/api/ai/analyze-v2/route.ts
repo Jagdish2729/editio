@@ -63,7 +63,19 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
   const durations = new Map<string, number>();
   for (const frame of body.frames) durations.set(frame.clipName, Math.max(0, frame.durationSeconds));
   const knownClips = Array.from(durations.keys());
-  const sequence = (raw.clipSequence || [])
+
+  // Some model responses put their strongest selections in bestMoments but leave
+  // clipSequence empty. Convert those anchors into usable cuts instead of failing
+  // an otherwise valid AI response.
+  const rawSequence = raw.clipSequence?.length
+    ? raw.clipSequence
+    : (raw.bestMoments || []).map(moment => ({
+        clip: moment.clip,
+        timestampSeconds: moment.timestampSeconds,
+        reason: moment.reason || "Selected as a strong moment."
+      }));
+
+  const sequence = rawSequence
     .map(item => ({ ...item, clip: resolveClipName(item.clip, knownClips) || undefined }))
     .filter(item => item.clip)
     .slice(0, 8)
@@ -79,9 +91,16 @@ function normalisePlan(raw: RawPlan, body: AnalyzeRequest): RawPlan {
       }
       start = Math.max(0, Math.min(start, Math.max(0, duration - 0.3)));
       end = Math.max(start + 0.75, Math.min(end, duration || end));
-      return { ...item, startSeconds: Number(start.toFixed(2)), endSeconds: Number(end.toFixed(2)), timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)), reason: item.reason || "Selected for the story." };
+      return {
+        ...item,
+        startSeconds: Number(start.toFixed(2)),
+        endSeconds: Number(end.toFixed(2)),
+        timestampSeconds: Number.isFinite(anchor) ? Number(anchor.toFixed(2)) : Number(((start + end) / 2).toFixed(2)),
+        reason: item.reason || "Selected for the story."
+      };
     })
     .filter(item => Number(item.endSeconds) > Number(item.startSeconds));
+
   const total = sequence.reduce((sum, item) => sum + Number(item.endSeconds) - Number(item.startSeconds), 0);
   return {
     visualSummary: raw.visualSummary || "AI-selected first-cut Reel based on the supplied footage.",
@@ -183,21 +202,35 @@ async function gemini(body: AnalyzeRequest, key: string, model: string) {
   const frameText = frames.map((f, i) => `Frame ${i + 1}: clip=${f.clipName}, time=${f.timestampSeconds}s, duration=${f.durationSeconds}s`).join("\n");
   const parts: Array<Record<string, unknown>> = [{ text: prompt(body, frameText) }];
   for (const frame of frames) { const part = geminiPart(frame.imageDataUrl); if (part) parts.push(part); }
+
   let last = "Gemini analysis failed.";
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  // High-demand responses are transient. Give the provider a little room to
+  // recover, but keep the retry bounded so one user action cannot loop forever.
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.12, responseMimeType: "application/json" } })
       });
       const data = await response.json();
-      if (!response.ok) { last = data?.error?.message || `Gemini failed (HTTP ${response.status}).`; if (attempt === 1 && transient(response.status)) { await sleep(1200); continue; } throw new Error(last); }
+      if (!response.ok) {
+        last = data?.error?.message || `Gemini failed (HTTP ${response.status}).`;
+        if (attempt < 3 && transient(response.status)) {
+          await sleep(attempt === 1 ? 2500 : 6000);
+          continue;
+        }
+        throw new Error(last);
+      }
       const text = data?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text || "").join("").trim();
       if (!text) throw new Error("Gemini returned an empty analysis.");
       return parseJson(text);
     } catch (error) {
       last = error instanceof Error ? error.message : last;
-      if (attempt === 1 && /fetch failed|timeout|timed out/i.test(last)) { await sleep(1200); continue; }
+      if (attempt < 3 && /fetch failed|timeout|timed out/i.test(last)) {
+        await sleep(attempt === 1 ? 2500 : 6000);
+        continue;
+      }
       throw new Error(last);
     }
   }
