@@ -1,11 +1,30 @@
 import { getUser } from "./session";
 
+export type AITextOverlay = {
+  text: string;
+  startSeconds: number;
+  endSeconds: number;
+  kind: "hook" | "editorial" | "caption" | "ending";
+  position?: "top" | "center" | "bottom";
+  style?: "clean" | "bold" | "cinematic" | "funny" | "sports";
+  animation?: "pop" | "fade" | "slide" | "none";
+};
+
+export type AISfx = {
+  timeSeconds: number;
+  type: "impact" | "whoosh" | "pop" | "record-scratch" | "crowd" | "ding";
+  durationSeconds?: number;
+  intensity?: number;
+};
+
 export type AIPlan = {
   visualSummary?: string;
+  heroMoment?: { clip: string; timestampSeconds: number; reason: string };
   bestMoments?: Array<{ clip: string; timestampSeconds: number; reason: string }>;
   targetDurationSeconds: number;
   aspectRatio?: "9:16" | string;
   hook: string;
+  hookEnabled?: boolean;
   clipSequence: Array<{
     clip: string;
     startSeconds?: number;
@@ -17,12 +36,20 @@ export type AIPlan = {
     zoomDirection?: "in" | "out" | "none";
   }>;
   captions?: Array<{ text: string; placement: string; style: string; startSeconds?: number; endSeconds?: number }>;
+  textOverlays?: AITextOverlay[];
   captionIdeas?: string[];
   transitions?: Array<{ afterClip: string; type: string }>;
   transitionDirection?: string;
   audioDirection: string;
+  musicMood?: "none" | "hype" | "cinematic" | "chill" | "funny" | "emotional";
+  musicIntensity?: number;
+  sfx?: AISfx[];
   colorDirection: string;
+  colorPreset?: "natural" | "crisp" | "warm" | "cinematic" | "punchy";
   ending: string;
+  coverText?: string;
+  socialCaption?: string;
+  hashtags?: string[];
 };
 
 export type EditMode = "ai" | "human" | "both";
